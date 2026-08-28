@@ -167,11 +167,24 @@ export interface TelegramWhitelistConfig {
 }
 
 export interface TelegramConfig {
-    mode: "bot" | "userbot";
+    /**
+     * - "bot": Bot API over MTProto（mtcute，需要 api_id/api_hash）
+     * - "userbot": 用户账号 MTProto（mtcute，需要 api_id/api_hash/phone）
+     * - "botapi": 标准 Bot API over HTTP 主动拉取（getUpdates 长轮询，无需 api_id/api_hash，
+     *   接口地址可指向反向代理的 bot.telegram.org，见 api_base_url）
+     */
+    mode: "bot" | "userbot" | "botapi";
     botToken: string;
     apiId: string;
     apiHash: string;
     phone: string;
+    /**
+     * botapi 模式的接口根地址。默认 https://api.telegram.org；
+     * 可指向反向代理地址（需同时转发 /bot<token>/* 方法与 /file/bot<token>/* 文件下载）。
+     */
+    apiBaseUrl?: string;
+    /** botapi 模式 getUpdates 长轮询超时秒数（默认 30，上限 50） */
+    pollTimeoutSec?: number;
     /** @deprecated 旧版入站白名单，仅用于迁移和 prewarm 兼容 */
     whitelist?: TelegramWhitelistConfig;
     /** bot 模式 mtcute pts 预热群列表（独立于白名单，用于无白名单时也能预热指定群） */
@@ -216,6 +229,24 @@ export interface OneBotConfig {
         minDelay: number;
         maxDelay: number;
     };
+}
+
+/**
+ * QQ 官方机器人（q.qq.com 开放平台）配置。
+ * 独立于 OneBot/NapCat（自建客户端协议）驱动，平台名为 "qqbot"；
+ * chatId 结构：qqbot:group:{group_openid}（群聊）/ qqbot:private:{user_openid}（C2C 单聊）。
+ */
+export interface QQBotConfig {
+    /** QQ 开放平台 AppID（q.qq.com 机器人管理页） */
+    appId: string;
+    /** AppSecret（用于换取 access_token） */
+    appSecret: string;
+    /** REST API 根地址（默认 https://api.sgroup.qq.com；沙箱环境 https://sandbox.api.sgroup.qq.com） */
+    apiBaseUrl?: string;
+    /** 认证服务地址（默认 https://bots.qq.com/app/getAppAccessToken，一般无需修改） */
+    authUrl?: string;
+    /** 是否接收单聊（C2C）消息，默认 true；群聊 @ 消息始终接收 */
+    c2cEnabled?: boolean;
 }
 
 export interface ReflectionExternalConfig {
@@ -563,6 +594,8 @@ export interface AppConfig {
     telegram?: TelegramConfig;
     discord?: DiscordConfig;
     onebot?: OneBotConfig;
+    /** QQ 官方机器人（开放平台 WebSocket 网关 + REST v2） */
+    qqbot?: QQBotConfig;
     notification: NotificationConfig;
     reflection: ReflectionExternalConfig;
     contextBudget?: ContextBudgetConfig;
@@ -702,6 +735,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
     const fileTG = (fileConfig.telegram ?? {}) as Record<string, unknown>;
     const fileDC = (fileConfig.discord ?? {}) as Record<string, unknown>;
     const fileOB = (fileConfig.onebot ?? {}) as Record<string, unknown>;
+    const fileQQ = (fileConfig.qqbot ?? {}) as Record<string, unknown>;
     const fileNotification = (fileConfig.notification ?? {}) as Record<string, unknown>;
     const fileReflection = (fileConfig.reflection ?? {}) as Record<string, unknown>;
     const fileMerge = (fileReflection.merge_thresholds ?? {}) as Record<string, unknown>;
@@ -742,11 +776,13 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         },
         timezone: str(fileConfig.timezone),
         telegram: Object.keys(fileTG).length > 0 ? {
-            mode: (str(fileTG.mode) as "bot" | "userbot") ?? "bot",
+            mode: (str(fileTG.mode) as TelegramConfig["mode"]) ?? "bot",
             botToken: str(fileTG.bot_token) ?? "",
             apiId: str(fileTG.api_id) ?? "",
             apiHash: str(fileTG.api_hash) ?? "",
             phone: str(fileTG.phone) ?? "",
+            apiBaseUrl: str(fileTG.api_base_url) ?? undefined,
+            pollTimeoutSec: fileTG.poll_timeout != null ? num(fileTG.poll_timeout, 30) : undefined,
             whitelist: parseTelegramWhitelist(fileTG),
             prewarm: parseTelegramPrewarm(fileTG),
             humanizedDelay: parseHumanizedDelay(fileTG),
@@ -761,6 +797,13 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
             sendFileAsDataUrl: fileOB.send_file_as_data_url != null ? Boolean(fileOB.send_file_as_data_url) : undefined,
             whitelist: parseOneBotWhitelist(fileOB),
             humanizedDelay: parseOneBotHumanizedDelay(fileOB),
+        } : undefined,
+        qqbot: Object.keys(fileQQ).length > 0 ? {
+            appId: str(fileQQ.app_id) ?? "",
+            appSecret: str(fileQQ.app_secret) ?? "",
+            apiBaseUrl: str(fileQQ.api_base_url) ?? undefined,
+            authUrl: str(fileQQ.auth_url) ?? undefined,
+            c2cEnabled: fileQQ.c2c_enabled != null ? Boolean(fileQQ.c2c_enabled) : undefined,
         } : undefined,
         notification: {
             mentionKeywords: Array.isArray(fileNotification.mention_keywords)
@@ -1966,8 +2009,11 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
     // telegram (optional)
     const tg = c.telegram as Record<string, unknown> | undefined;
     if (tg) {
-        if (!tg.mode || (tg.mode !== "bot" && tg.mode !== "userbot")) {
-            errors.push("telegram.mode 必须是 \"bot\" 或 \"userbot\"");
+        if (!tg.mode || (tg.mode !== "bot" && tg.mode !== "userbot" && tg.mode !== "botapi")) {
+            errors.push("telegram.mode 必须是 \"bot\" / \"userbot\" / \"botapi\"");
+        }
+        if (tg.mode === "botapi" && !tg.botToken) {
+            errors.push("telegram.botapi 模式必须配置 bot_token（无需 api_id/api_hash）");
         }
         // whitelist enabled + empty lists = reject all — valid config, no error
     }
@@ -1986,6 +2032,13 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
     const dc = c.discord as Record<string, unknown> | undefined;
     if (dc) {
         if (!dc.botToken) errors.push("discord.botToken 不能为空");
+    }
+
+    // qqbot (optional)
+    const qq = c.qqbot as Record<string, unknown> | undefined;
+    if (qq) {
+        if (!qq.appId) errors.push("qqbot.appId 不能为空");
+        if (!qq.appSecret) errors.push("qqbot.appSecret 不能为空");
     }
 
     // onebot (optional)

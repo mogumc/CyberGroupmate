@@ -41,8 +41,10 @@ import { join, resolve, relative } from "node:path";
 import { createLogger } from "./core/logger.js";
 import { setGlobalTimezone, getGlobalTimezone } from "./core/timezone.js";
 import { TelegramAdapter } from "./adapter/telegram-adapter.js";
+import { TelegramBotApiAdapter } from "./adapter/telegram-botapi-adapter.js";
 import { DiscordAdapter } from "./adapter/discord-adapter.js";
 import { OneBotAdapter } from "./adapter/onebot-adapter.js";
+import { QQBotOfficialAdapter } from "./adapter/qqbot-official-adapter.js";
 import type { PlatformAdapter } from "./adapter/platform-adapter.js";
 import { BackfillCoordinator, resolveBackfillConfig, BACKFILL_FLAG, BACKFILL_STALE_FLAG, BACKFILL_DIRECT_REASON } from "./adapter/backfill.js";
 import { markChatAsRead } from "./adapter/read-receipts.js";
@@ -298,9 +300,16 @@ async function main(): Promise<void> {
     if (appConfig.telegram) {
         log.info("Telegram 配置", {
             mode: appConfig.telegram.mode,
-            apiId: appConfig.telegram.apiId ? "✓" : "✗",
-            apiHash: appConfig.telegram.apiHash ? "✓" : "✗",
-            botToken: appConfig.telegram.botToken ? "✓" : "✗",
+            ...(appConfig.telegram.mode === "botapi"
+                ? {
+                    apiBaseUrl: appConfig.telegram.apiBaseUrl ?? "https://api.telegram.org",
+                    botToken: appConfig.telegram.botToken ? "✓" : "✗",
+                }
+                : {
+                    apiId: appConfig.telegram.apiId ? "✓" : "✗",
+                    apiHash: appConfig.telegram.apiHash ? "✓" : "✗",
+                    botToken: appConfig.telegram.botToken ? "✓" : "✗",
+                }),
         });
     }
     if (appConfig.discord) {
@@ -313,6 +322,13 @@ async function main(): Promise<void> {
         log.info("OneBot 配置", {
             wsUrl: appConfig.onebot.wsUrl ? "✓" : "✗",
             selfId: appConfig.onebot.selfId ? "✓" : "✗",
+        });
+    }
+    if (appConfig.qqbot) {
+        log.info("QQ 官方 bot 配置", {
+            appId: appConfig.qqbot.appId ? "✓" : "✗",
+            apiBase: appConfig.qqbot.apiBaseUrl ?? "https://api.sgroup.qq.com",
+            c2cEnabled: appConfig.qqbot.c2cEnabled !== false,
         });
     }
     log.info("全平台入站 Filter", {
@@ -454,14 +470,18 @@ async function main(): Promise<void> {
     const adapters: PlatformAdapter[] = [];
 
     if (appConfig.telegram) {
-        const telegramAdapter = new TelegramAdapter(
-            appConfig.telegram,
-            nc,
-            promptUser,
-            (message) => console.log(`🤖 ${message}`),
-            undefined, // use default client factory
-            sharedMediaDownloader,
-        );
+        // mode="botapi" → 标准 Bot API over HTTP 驱动（可指向反向代理的 bot.telegram.org）；
+        // bot / userbot → mtcute MTProto 驱动。两者对外接口面一致，管线无感知。
+        const telegramAdapter = appConfig.telegram.mode === "botapi"
+            ? new TelegramBotApiAdapter(appConfig.telegram, nc, sharedMediaDownloader)
+            : new TelegramAdapter(
+                appConfig.telegram,
+                nc,
+                promptUser,
+                (message) => console.log(`🤖 ${message}`),
+                undefined, // use default client factory
+                sharedMediaDownloader,
+            );
         adapters.push(telegramAdapter);
     }
 
@@ -475,8 +495,14 @@ async function main(): Promise<void> {
         adapters.push(onebotAdapter);
     }
 
+    if (appConfig.qqbot) {
+        // QQ 官方开放平台驱动（WebSocket 网关 + REST v2），与 OneBot/NapCat 独立
+        const qqbotAdapter = new QQBotOfficialAdapter(appConfig.qqbot, nc, sharedMediaDownloader);
+        adapters.push(qqbotAdapter);
+    }
+
     if (adapters.length === 0) {
-        throw new Error("至少需要配置一个平台 adapter（telegram / discord / onebot）");
+        throw new Error("至少需要配置一个平台 adapter（telegram / discord / onebot / qqbot）");
     }
 
     // 通用路由函数

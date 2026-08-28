@@ -15,7 +15,7 @@
  */
 
 /** 支持的平台名称 */
-export type PlatformName = "telegram" | "discord" | "onebot";
+export type PlatformName = "telegram" | "discord" | "onebot" | "qqbot";
 
 /** parseChatId 的返回结构 */
 export interface ParsedChatId {
@@ -38,7 +38,7 @@ export interface ParsedChatId {
     channelId?: string;
 }
 
-const VALID_PLATFORMS = new Set<string>(["telegram", "discord", "onebot"]);
+const VALID_PLATFORMS = new Set<string>(["telegram", "discord", "onebot", "qqbot"]);
 
 /**
  * 创建 composite chatId。
@@ -125,6 +125,16 @@ export function parseChatId(compositeId: string): ParsedChatId {
             result.groupId = rest.slice(secondColon + 1);
         }
         // onebot:private:xxx → 无 groupId（私聊不是群组）
+    }
+
+    // QQ 官方 bot 三段式: qqbot:group:group_openid / qqbot:private:user_openid
+    // （openid 形如 "ABC123xyz"，不含冒号，结构与 OneBot 同构）
+    if (platform === "qqbot") {
+        const secondColon = rest.indexOf(":");
+        if (secondColon !== -1 && rest.slice(0, secondColon) === "group") {
+            result.groupId = rest.slice(secondColon + 1);
+        }
+        // qqbot:private:xxx → 无 groupId（C2C 私聊不是群组）
     }
 
     return result;

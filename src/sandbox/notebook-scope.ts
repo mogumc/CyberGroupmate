@@ -26,6 +26,7 @@ export const NOTEBOOK_RESERVED_NAMES = new Set([
     "discord",
     "onebot",
     "qq",
+    "qqbot",
     "__notebookScope",
     "__notebookWith",
     "__notebookAssign",

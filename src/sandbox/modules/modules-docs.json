@@ -402,6 +402,43 @@
     "typeDefs": "interface PrivacyModule {\n    /**\n     * 把某个会话标记为敏感/私密（append-only：只进不出，标记后无法撤销，重启后依然生效）。\n     *\n     * 典型场景：群里有人表达出对「bot 把这里的对话带到别处 / 记住并外泄」的担忧时，\n     * 你可以主动调用本方法把当前会话收紧为私密。之后：\n     * - 在别的会话里再也无法读到本会话的消息/话题/私密 fact；\n     * - 绑定在本会话时，向其它会话 sendText / dispatch 会被代码拦截。\n     *\n     * 注意：管理员可通过 privacy.allow_llm_mark_sensitive=false 禁用本方法；被禁用时调用会抛错。\n     *\n     * @param chatId 目标 composite chatId；省略则标记「当前会话」。标记是单调收紧方向，传任意 chatId 都安全。\n     * @param reason 标记原因（便于日后审计），如 \"群友明确表示不希望对话被带出本群\"。\n     *\n     * @example\n     * // 感知到隐私顾虑，收紧当前会话\n     * await privacy.markSensitive(undefined, \"群友表达了对隐私的担忧，主动收紧\");\n     */\n    markSensitive(chatId?: string, reason?: string): Promise<{\n        chatId: string;\n        visibility: \"private\" | \"shared\";\n        markedSensitive: boolean;\n        reason?: string;\n    }>;\n\n    /**\n     * 查询某会话当前的隐私状态（visibility 及其来源）。\n     *\n     * @param chatId 目标 composite chatId；省略则查询「当前会话」。\n     *\n     * @example\n     * const s = await privacy.status();\n     * if (s.visibility === \"private\") console.log(\"本会话内容不会外泄\");\n     */\n    status(chatId?: string): Promise<{\n        chatId: string;\n        visibility: \"private\" | \"shared\";\n        isDirectMessage: boolean;\n        markedSensitive: boolean;\n        reason?: string;\n        /** private 的来源：dm（私聊自动）| config（配置种子）| marked（运行时标记）| none（shared）。 */\n        source: \"dm\" | \"config\" | \"marked\" | \"none\";\n    }>;\n}"
   },
   {
+    "name": "qqbot",
+    "description": "qqbot.d.ts — QQ 官方机器人平台 API（q.qq.com 开放平台） 系统注入的 QQ 官方平台 host proxy 接口。 与 OneBot/NapCat（onebot/qq 模块）完全独立：本模块走官方 WebSocket 网关 + REST v2。 平台硬限制： - 群聊只能收到 @ bot 的消息（平台只投递 @ 消息） - 发送为被动回复：收到消息 5 分钟内有效，每条 msg_id 最多 5 次；主动消息需平台配额 - 无历史消息 / 成员列表 / 昵称 API（openid 是唯一定位符） - 发送媒体仅支持公网可访问 https URL（图片/视频/音频三类）",
+    "methods": [
+      {
+        "name": "sendText",
+        "brief": "发送文本消息（被动回复优先）。 chatId 来自消息上下文（qqbot:group:{group_openid} 或 qqbot:private:{user_openid}）。 注意：群聊里用户只能通过 @ bot 触发你，回复内容无需再 @。",
+        "fullDoc": "```typescript\nsendText(chatId: string, text: string): Promise<QQBotSendAck | null>\n```\n\n\n发送文本消息（被动回复优先）。\nchatId 来自消息上下文（qqbot:group:{group_openid} 或 qqbot:private:{user_openid}）。\n注意：群聊里用户只能通过 @ bot 触发你，回复内容无需再 @。\n\n**示例：**\n```typescript\nawait qqbot.sendText(chatId, \"来啦来啦\");\n```"
+      },
+      {
+        "name": "sendMedia",
+        "brief": "发送媒体消息（图片/视频/音频）。 官方平台仅接受公网可访问的 https URL；本地文件请先上传图床。",
+        "fullDoc": "```typescript\nsendMedia(chatId: string, media: QQBotMediaPayload): Promise<QQBotSendAck | null>\n```\n\n\n发送媒体消息（图片/视频/音频）。\n官方平台仅接受公网可访问的 https URL；本地文件请先上传图床。\n\n**示例：**\n```typescript\nawait qqbot.sendMedia(chatId, { type: \"photo\", file: \"https://example.com/cat.jpg\", caption: \"看图\" });\n```"
+      },
+      {
+        "name": "sendTyping",
+        "brief": "官方平台无 typing 指示，no-op。",
+        "fullDoc": "```typescript\nsendTyping(chatId: string): Promise<null>\n```\n\n\n官方平台无 typing 指示，no-op。"
+      },
+      {
+        "name": "getChat",
+        "brief": "获取会话基础信息。openid 无群详情 API，仅返回类型（group/private）与本地已知信息。",
+        "fullDoc": "```typescript\ngetChat(chatId: string): Promise<Record<string, unknown>>\n```\n\n\n获取会话基础信息。openid 无群详情 API，仅返回类型（group/private）与本地已知信息。"
+      },
+      {
+        "name": "getMe",
+        "brief": "获取 bot 自身信息（app_id 等）。",
+        "fullDoc": "```typescript\ngetMe(): Promise<Record<string, unknown>>\n```\n\n\n获取 bot 自身信息（app_id 等）。"
+      },
+      {
+        "name": "downloadMedia",
+        "brief": "下载入站媒体（消息 mediaInfo.fileId 指向的 attachments URL）。 返回 { buffer: base64, size }。",
+        "fullDoc": "```typescript\ndownloadMedia(fileId: string): Promise<{ buffer: string; size: number }>\n```\n\n\n下载入站媒体（消息 mediaInfo.fileId 指向的 attachments URL）。\n返回 { buffer: base64, size }。\n\n**示例：**\n```typescript\nconst { buffer, size } = await qqbot.downloadMedia(mediaInfo.fileId);\n```"
+      }
+    ],
+    "typeDefs": "interface QQBotMediaPayload {\n    /** 媒体类型：photo（图片，file_type=1）、video（视频，file_type=2）、audio/voice（音频，file_type=3） */\n    type?: string;\n    /** 公网可访问的 https URL（平台服务器自行拉取；不支持本地路径 / Buffer / data: URL） */\n    file?: string;\n    /** 同 file，二选一 */\n    url?: string;\n    /** 媒体说明文字。官方媒体消息不支持内嵌 caption，会作为独立文本消息随后发送 */\n    caption?: string;\n}\n\ninterface QQBotSendAck {\n    /** 官方返回的消息 ID */\n    id?: string;\n    /** 是否为被动回复（携带 msg_id 发出） */\n    isPassive?: boolean;\n    [key: string]: unknown;\n}"
+  },
+  {
     "name": "runtime",
     "description": "shared/runtime.d.ts — 系统级能力",
     "methods": [

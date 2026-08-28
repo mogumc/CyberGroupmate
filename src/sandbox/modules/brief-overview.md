@@ -107,6 +107,16 @@ modules/privacy.d.ts — 隐私分级模块类型定义 全局 visibility 兜底
 - `markSensitive`: 把某个会话标记为敏感/私密（append-only：只进不出，标记后无法撤销，重启后依然生效）。 典型场景：群里有人表达出对「bot 把这里的对话带到别处 / 记住并外泄」的担忧时， 你可以主动调用本方法把当前会话收紧为私密。之后： - 在别的会话里再也无法读到本会话的消息/话题/私密 fact； - 绑定在本会话时，向其它会话 sendText / dispatch 会被代码拦截。 注意：管理员可通过 privacy.allow_llm_mark_sensitive=false 禁用本方法；被禁用时调用会抛错。
 - `status`: 查询某会话当前的隐私状态（visibility 及其来源）。
 
+## qqbot
+qqbot.d.ts — QQ 官方机器人平台 API（q.qq.com 开放平台） 系统注入的 QQ 官方平台 host proxy 接口。 与 OneBot/NapCat（onebot/qq 模块）完全独立：本模块走官方 WebSocket 网关 + REST v2。 平台硬限制： - 群聊只能收到 @ bot 的消息（平台只投递 @ 消息） - 发送为被动回复：收到消息 5 分钟内有效，每条 msg_id 最多 5 次；主动消息需平台配额 - 无历史消息 / 成员列表 / 昵称 API（openid 是唯一定位符） - 发送媒体仅支持公网可访问 https URL（图片/视频/音频三类）
+
+- `sendText`: 发送文本消息（被动回复优先）。 chatId 来自消息上下文（qqbot:group:{group_openid} 或 qqbot:private:{user_openid}）。 注意：群聊里用户只能通过 @ bot 触发你，回复内容无需再 @。
+- `sendMedia`: 发送媒体消息（图片/视频/音频）。 官方平台仅接受公网可访问的 https URL；本地文件请先上传图床。
+- `sendTyping`: 官方平台无 typing 指示，no-op。
+- `getChat`: 获取会话基础信息。openid 无群详情 API，仅返回类型（group/private）与本地已知信息。
+- `getMe`: 获取 bot 自身信息（app_id 等）。
+- `downloadMedia`: 下载入站媒体（消息 mediaInfo.fileId 指向的 attachments URL）。 返回 { buffer: base64, size }。
+
 ## runtime
 shared/runtime.d.ts — 系统级能力
 

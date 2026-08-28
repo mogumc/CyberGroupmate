@@ -5,7 +5,9 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  '@mtcute/core': 894ab1e89f0469f8d4648b8f742219eac4801aa254c46f9750e6cfa7f7a928ce
+  '@mtcute/core':
+    hash: 894ab1e89f0469f8d4648b8f742219eac4801aa254c46f9750e6cfa7f7a928ce
+    path: patches/@mtcute__core.patch
 
 importers:
 

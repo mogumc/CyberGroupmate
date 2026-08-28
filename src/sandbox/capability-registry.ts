@@ -10,6 +10,7 @@ import { installSkills } from "./modules/skills/index.js";
 import { createTelegramClientProxy } from "./modules/telegram/index.js";
 import { createDiscordClientProxy } from "./modules/discord/index.js";
 import { createOneBotClientProxy } from "./modules/onebot/index.js";
+import { createQQBotClientProxy } from "./modules/qqbot/index.js";
 import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
 
 // ─── 环境接口 ───
@@ -78,11 +79,14 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
     let telegram: unknown = undefined;
     let discord: unknown = undefined;
     let onebot: unknown = undefined;
+    let qqbot: unknown = undefined;
 
     if (platform === "discord") {
         discord = createDiscordClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     } else if (platform === "onebot") {
         onebot = createOneBotClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
+    } else if (platform === "qqbot") {
+        qqbot = createQQBotClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     } else {
         // 默认 telegram（向后兼容）
         telegram = createTelegramClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
@@ -94,5 +98,6 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
         telegram,
         discord,
         onebot,
+        qqbot,
     };
 }
