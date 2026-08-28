@@ -276,6 +276,9 @@ export class WeChatAdapter implements PlatformAdapter {
         this.validateConfig();
         this.connection.markConnecting("weixin iLink");
 
+        // 恢复持久化凭据（扫码成功后保存；token 失效时由 getupdates errcode -14 清除重扫）
+        this.loadPersistedSession();
+
         if (this.token) {
             // 已有凭据：直接进入收消息循环
             this.connection.markConnected(`ilink bot, base=${this.baseUrl}`);
