@@ -304,6 +304,23 @@ telegram:
 #   # 是否接收单聊（C2C）消息，默认 true
 #   # c2c_enabled: true
 
+# ─── 微信设置（Claw / OpenClaw-weixin 协议） ───
+# 可选。独立 adapter，与 OneBot / qqbot 完全独立、可同时启用。
+# 对接 Tencent `@tencent-weixin/openclaw-weixin` 插件所使用的 iLink bot HTTP 协议：
+# 启动后进入扫码登录（二维码打印到终端并显示在 Dashboard），登录凭据持久化到
+# workspace/wechat-session/<session_name>.json，重启免扫码（会话超时 errcode -14 后需重新扫码）。
+# 微信（iLink bot）平台限制：无历史消息 API；回复优先为被动回复（context_token）；
+# 发送媒体走 iLink CDN 加密上传（图片/视频/文件），语音发送暂不支持。
+# wechat:
+#   # 已登录的 bot token（可选，不填则启动扫码登录；也可从 openclaw-weixin 插件凭据导入）
+#   # token: ""
+#   # iLink 网关地址（默认 https://ilinkai.weixin.qq.com，一般无需修改）
+#   # api_base_url: "https://ilinkai.weixin.qq.com"
+#   # 会话名（凭据/游标持久化文件名，默认 "default"；多账号时用不同名字）
+#   # session_name: "default"
+#   # bot_agent 自我声明（UA 风格，仅用于腾讯后台观测）
+#   # bot_agent: "CyberGroupmate/0.1.0"
+
 # ─── Reflection 设置 ───
 # 控制反思引擎的行为参数
 reflection:

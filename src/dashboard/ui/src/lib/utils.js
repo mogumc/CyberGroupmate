@@ -60,6 +60,7 @@ export function platformIcon(platform) {
     case 'discord': return '🎮';
     case 'onebot': return '🐧';
     case 'qqbot': return '🤖';
+    case 'wechat': return '💚';
     default: return '';
   }
 }
@@ -73,6 +74,7 @@ export function platformLabel(platform) {
     case 'discord': return 'DC';
     case 'onebot': return 'QQ';
     case 'qqbot': return 'QQ官';
+    case 'wechat': return '微信';
     default: return platform.toUpperCase().slice(0, 2);
   }
 }

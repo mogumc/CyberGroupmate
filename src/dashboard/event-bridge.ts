@@ -200,7 +200,7 @@ export class EventBridge {
             if (this.clients.size === 0) return;
             const adapters = collectAdapterStatuses(this.deps);
             const fingerprint = JSON.stringify(adapters.map((a) =>
-                [a.platform, a.state, a.reconnectAttempts, a.nextRetryAt, a.lastError].join("|")
+                [a.platform, a.state, a.reconnectAttempts, a.nextRetryAt, a.lastError, a.qrCodeUrl ? "qr" : ""].join("|")
             ));
             if (fingerprint === this.lastAdapterFingerprint) return;
             this.lastAdapterFingerprint = fingerprint;

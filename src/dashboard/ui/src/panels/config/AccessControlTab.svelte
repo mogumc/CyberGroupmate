@@ -110,7 +110,7 @@
 </div>
 
 <p class="text-xs opacity-50 mt-3 mb-2">
-  支持 composite ID、raw ID 和 <code>*</code> 通配符，例如 <code>telegram:-100123</code>、<code>onebot:group:456</code>、<code>qqbot:group:ABC123</code>、<code>discord:*</code>。会话或发送者任一命中即视为命中。
+  支持 composite ID、raw ID 和 <code>*</code> 通配符，例如 <code>telegram:-100123</code>、<code>onebot:group:456</code>、<code>qqbot:group:ABC123</code>、<code>wechat:private:wxid_xxx</code>、<code>discord:*</code>。会话或发送者任一命中即视为命中。
 </p>
 <div class="cfg-grid-2">
   <div class="cfg-field">
@@ -135,7 +135,7 @@
 
 <div class="divider text-xs opacity-50 my-3">隐身用户（全平台）</div>
 <p class="text-xs opacity-50 mb-2">
-  用户主动隐身名单，等同于 Telegram 用户发送 <code>/invisible</code>。使用 composite 用户 ID，例如 <code>telegram:123</code>、<code>discord:456</code>、<code>onebot:789</code>、<code>qqbot:GRPabc</code>；独立保存并立即生效。
+  用户主动隐身名单，等同于 Telegram 用户发送 <code>/invisible</code>。使用 composite 用户 ID，例如 <code>telegram:123</code>、<code>discord:456</code>、<code>onebot:789</code>、<code>qqbot:GRPabc</code>、<code>wechat:wxid_xxx</code>；独立保存并立即生效。
 </p>
 <div class="cfg-field">
   <MonacoEditor

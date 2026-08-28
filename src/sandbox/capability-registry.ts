@@ -11,6 +11,7 @@ import { createTelegramClientProxy } from "./modules/telegram/index.js";
 import { createDiscordClientProxy } from "./modules/discord/index.js";
 import { createOneBotClientProxy } from "./modules/onebot/index.js";
 import { createQQBotClientProxy } from "./modules/qqbot/index.js";
+import { createWeChatClientProxy } from "./modules/wechat/index.js";
 import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
 
 // ─── 环境接口 ───
@@ -80,6 +81,7 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
     let discord: unknown = undefined;
     let onebot: unknown = undefined;
     let qqbot: unknown = undefined;
+    let wechat: unknown = undefined;
 
     if (platform === "discord") {
         discord = createDiscordClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
@@ -87,6 +89,8 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
         onebot = createOneBotClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     } else if (platform === "qqbot") {
         qqbot = createQQBotClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
+    } else if (platform === "wechat") {
+        wechat = createWeChatClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     } else {
         // 默认 telegram（向后兼容）
         telegram = createTelegramClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
@@ -99,5 +103,6 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
         discord,
         onebot,
         qqbot,
+        wechat,
     };
 }

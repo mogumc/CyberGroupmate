@@ -10,6 +10,7 @@
   import DiscordTab from "./config/DiscordTab.svelte";
   import OneBotTab from "./config/OneBotTab.svelte";
   import QQBotTab from "./config/QQBotTab.svelte";
+  import WeChatTab from "./config/WeChatTab.svelte";
   import ReflectionTab from "./config/ReflectionTab.svelte";
   import ContextBudgetTab from "./config/ContextBudgetTab.svelte";
   import EmbeddingTab from "./config/EmbeddingTab.svelte";
@@ -36,6 +37,7 @@
   let discordEnabled = false;
   let onebotEnabled = false;
   let qqbotEnabled = false;
+  let wechatEnabled = false;
 
   /** Password 输入框：focus 显示明文，blur 恢复隐藏 */
   function pwFocus(e) { e.target.type = 'text'; }
@@ -60,6 +62,7 @@
     { id: "discord", label: "Discord", icon: "fa-gamepad" },
     { id: "onebot", label: "QQ / OneBot", icon: "fa-comments" },
     { id: "qqbot", label: "QQ 官方 Bot", icon: "fa-robot" },
+    { id: "wechat", label: "微信", icon: "fa-comment-dots" },
     { id: "reflection", label: "反思引擎", icon: "fa-brain" },
     { id: "contextBudget", label: "上下文预算", icon: "fa-sliders" },
     { id: "embedding", label: "Embedding", icon: "fa-vector-square" },
@@ -77,7 +80,7 @@
     { id: "envVars", label: "环境变量", icon: "fa-key" },
   ];
 
-  const RESTART_SECTIONS = new Set(["embedding", "privacy", "dashboard", "backgroundAgent", "metrics", "qqbot"]);
+  const RESTART_SECTIONS = new Set(["embedding", "privacy", "dashboard", "backgroundAgent", "metrics", "qqbot", "wechat"]);
   const RESTART_FIELDS = {
     telegram: ["mode", "botToken", "apiId", "apiHash", "phone", "apiBaseUrl", "pollTimeoutSec"],
     discord: ["botToken"],
@@ -149,6 +152,7 @@
       discordEnabled = !!config.discord?.botToken;
       onebotEnabled = !!(config.onebot?.wsUrl && config.onebot?.selfId);
       qqbotEnabled = !!(config.qqbot?.appId && config.qqbot?.appSecret);
+      wechatEnabled = !!config.wechat;
       // 始终确保 UI 有空对象可绑定
       if (!config.telegram) config.telegram = { mode: 'bot', botToken: '', apiId: '', apiHash: '', phone: '' };
       if (config.telegram.apiBaseUrl == null) config.telegram.apiBaseUrl = '';
@@ -157,6 +161,7 @@
       if (!config.onebot) config.onebot = { wsUrl: '', selfId: '', sendFileAsDataUrl: false };
       if (!config.qqbot) config.qqbot = { appId: '', appSecret: '', apiBaseUrl: '', authUrl: '', c2cEnabled: true };
       if (config.qqbot.c2cEnabled == null) config.qqbot.c2cEnabled = true;
+      if (!config.wechat) config.wechat = { token: '', apiBaseUrl: '', sessionName: 'default', botAgent: '' };
       if (config.onebot.sendFileAsDataUrl == null) config.onebot.sendFileAsDataUrl = false;
       if (!config.onebot.humanizedDelay) {
         config.onebot.humanizedDelay = {
@@ -209,6 +214,7 @@
       if (!discordEnabled) delete payload.discord;
       if (!onebotEnabled) delete payload.onebot;
       if (!qqbotEnabled) delete payload.qqbot;
+      if (!wechatEnabled) delete payload.wechat;
       const res = await api("/config", { method: "PUT", body: payload });
       if (res.ok) {
         originalConfig = JSON.parse(JSON.stringify(config));
@@ -621,6 +627,8 @@
             <OneBotTab bind:config bind:onebotEnabled />
           {:else if currentSection === "qqbot"}
             <QQBotTab bind:config bind:qqbotEnabled {pwFocus} {pwBlur} />
+          {:else if currentSection === "wechat"}
+            <WeChatTab bind:config bind:wechatEnabled {pwFocus} {pwBlur} />
           {:else if currentSection === "reflection"}
             <ReflectionTab bind:config />
           {:else if currentSection === "contextBudget"}

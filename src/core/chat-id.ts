@@ -15,7 +15,7 @@
  */
 
 /** 支持的平台名称 */
-export type PlatformName = "telegram" | "discord" | "onebot" | "qqbot";
+export type PlatformName = "telegram" | "discord" | "onebot" | "qqbot" | "wechat";
 
 /** parseChatId 的返回结构 */
 export interface ParsedChatId {
@@ -38,7 +38,7 @@ export interface ParsedChatId {
     channelId?: string;
 }
 
-const VALID_PLATFORMS = new Set<string>(["telegram", "discord", "onebot", "qqbot"]);
+const VALID_PLATFORMS = new Set<string>(["telegram", "discord", "onebot", "qqbot", "wechat"]);
 
 /**
  * 创建 composite chatId。
@@ -135,6 +135,16 @@ export function parseChatId(compositeId: string): ParsedChatId {
             result.groupId = rest.slice(secondColon + 1);
         }
         // qqbot:private:xxx → 无 groupId（C2C 私聊不是群组）
+    }
+
+    // 微信（Wechaty）三段式: wechat:group:roomId / wechat:private:contactId
+    // （WeChat id 可能含 "@" 前缀等，不含冒号）
+    if (platform === "wechat") {
+        const secondColon = rest.indexOf(":");
+        if (secondColon !== -1 && rest.slice(0, secondColon) === "group") {
+            result.groupId = rest.slice(secondColon + 1);
+        }
+        // wechat:private:xxx → 无 groupId（私聊不是群组）
     }
 
     return result;

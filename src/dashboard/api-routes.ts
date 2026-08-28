@@ -68,6 +68,7 @@ const BUILTIN_DEBUG_DTS: Record<string, string> = {
     discord: "discord/discord.d.ts",
     onebot: "onebot/onebot.d.ts",
     qqbot: "qqbot/qqbot.d.ts",
+    wechat: "wechat/wechat.d.ts",
 };
 
 function qs(val: unknown): string {

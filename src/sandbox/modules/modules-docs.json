@@ -800,5 +800,47 @@
       }
     ],
     "typeDefs": "interface VisionSeeOptions {\n    /**\n     * 自定义分析视角/指令。不传时使用默认描述（\"详细描述图片内容\"）。\n     * 传入后会以该 prompt 分析所有传入的图片，适合特定任务（数人数、提取文字/代码、配色分析等）。\n     * 使用自定义 prompt 时结果保留原始换行格式（便于代码/列表输出）；默认描述则折叠为单行。\n     */\n    prompt?: string;\n}\n\ninterface VisionModule {\n    /**\n     * 看图：读取一张或多张图片文件，返回每张图片的文字描述。\n     * 使用 Vision LLM 分析图片内容，支持 JPEG、PNG、WebP 等常见格式。\n     *\n     * @param imagePaths - 图片文件路径（支持绝对路径或相对于 workspace/ 的相对路径），可传入多个参数\n     * @returns 每张图片的详细文字描述数组（与输入路径一一对应）\n     *\n     * @example\n     * // 查看单张图片\n     * const [desc] = await vision.see(\"screenshots/page.png\");\n     * console.log(desc);\n     *\n     * @example\n     * // 同时查看多张图片\n     * const descriptions = await vision.see(\"img1.jpg\", \"img2.png\", \"data/chart.png\");\n     * descriptions.forEach((d, i) => console.log(`图片${i+1}: ${d}`));\n     */\n    see(...imagePaths: string[]): Promise<string[]>;\n\n    /**\n     * 看图（自定义分析）：用指定 prompt 分析图片，而不是默认的\"描述内容\"。\n     *\n     * @param options - 分析配置（目前支持 prompt 字段）\n     * @param imagePaths - 图片文件路径，可传入多个\n     * @returns 每张图片按 prompt 分析得到的文字数组（与输入路径一一对应）\n     *\n     * @example\n     * // 数图片里的人数\n     * const [count] = await vision.see({ prompt: \"数一下图里有多少人，只回答数字\" }, \"photo.jpg\");\n     *\n     * @example\n     * // 提取图片里的代码（保留原格式）\n     * const [code] = await vision.see({ prompt: \"完整提取图片中的代码，保持原格式\" }, \"screenshot.png\");\n     *\n     * @example\n     * // 同一 prompt 分析多张图片\n     * const results = await vision.see({ prompt: \"描述配色方案\" }, \"design1.png\", \"design2.png\");\n     */\n    see(options: VisionSeeOptions, ...imagePaths: string[]): Promise<string[]>;\n}"
+  },
+  {
+    "name": "wechat",
+    "description": "wechat.d.ts — 微信渠道 API（Claw/OpenClaw-weixin 协议，iLink bot 扫码登录） 系统注入的微信 host proxy 接口。 与 onebot/qq（NapCat）和 qqbot（官方开放平台）完全独立。 平台限制： - 无历史消息 API（离线/断线期间的消息无法补抓；轮询游标已持久化，运行期间不丢消息） - 已读回执不存在；发送语音暂不支持（iLink CDN 需要 silk 编码） - 回复优先走被动回复（入站消息 context_token），无上下文的发送受平台主动消息配额约束",
+    "methods": [
+      {
+        "name": "sendText",
+        "brief": "发送文本消息。 chatId 来自消息上下文（wechat:private:{from_user_id} 或 wechat:group:{group_id}）。",
+        "fullDoc": "```typescript\nsendText(chatId: string, text: string): Promise<WeChatSendAck | null>\n```\n\n\n发送文本消息。\r\nchatId 来自消息上下文（wechat:private:{from_user_id} 或 wechat:group:{group_id}）。\n\n**示例：**\n```typescript\nawait wechat.sendText(chatId, \"来啦来啦\");\n```"
+      },
+      {
+        "name": "sendMedia",
+        "brief": "发送媒体消息（图片/视频/语音/文件）。支持公网 URL 与本地路径。",
+        "fullDoc": "```typescript\nsendMedia(chatId: string, media: WeChatMediaPayload): Promise<WeChatSendAck | null>\n```\n\n\n发送媒体消息（图片/视频/语音/文件）。支持公网 URL 与本地路径。\n\n**示例：**\n```typescript\nawait wechat.sendMedia(chatId, { type: \"photo\", file: \"media-cache/abc.jpg\", caption: \"看图\" });\n```"
+      },
+      {
+        "name": "sendFile",
+        "brief": "发送本地文件。",
+        "fullDoc": "```typescript\nsendFile(chatId: string, filePath: string, opts?: { caption?: string; fileName?: string }): Promise<WeChatSendAck | null>\n```\n\n\n发送本地文件。\n\n**示例：**\n```typescript\nawait wechat.sendFile(chatId, \"Downloads/report.pdf\", { caption: \"日报\" });\n```"
+      },
+      {
+        "name": "sendTyping",
+        "brief": "微信无 typing 指示，no-op。",
+        "fullDoc": "```typescript\nsendTyping(chatId: string): Promise<null>\n```\n\n\n微信无 typing 指示，no-op。"
+      },
+      {
+        "name": "getChat",
+        "brief": "获取会话基础信息（群名 / 联系人备注名）。",
+        "fullDoc": "```typescript\ngetChat(chatId: string): Promise<Record<string, unknown>>\n```\n\n\n获取会话基础信息（群名 / 联系人备注名）。"
+      },
+      {
+        "name": "getMe",
+        "brief": "获取 bot 自身信息（登录账号 id 与昵称）。",
+        "fullDoc": "```typescript\ngetMe(): Promise<Record<string, unknown>>\n```\n\n\n获取 bot 自身信息（登录账号 id 与昵称）。"
+      },
+      {
+        "name": "downloadMedia",
+        "brief": "取回入站媒体二进制（按 mediaInfo.uniqueFileId，从本地媒体缓存读取）。 返回 { buffer: base64, size }。",
+        "fullDoc": "```typescript\ndownloadMedia(uniqueFileId: string): Promise<{ buffer: string; size: number }>\n```\n\n\n取回入站媒体二进制（按 mediaInfo.uniqueFileId，从本地媒体缓存读取）。\r\n返回 { buffer: base64, size }。"
+      }
+    ],
+    "typeDefs": "interface WeChatMediaPayload {\r\n    /** 媒体类型：photo / video / audio / document（发送侧主要影响占位日志） */\r\n    type?: string;\r\n    /** 公网 URL 或本地路径（相对 workspace 或绝对路径） */\r\n    file?: string;\r\n    /** 同 file，二选一 */\r\n    url?: string;\r\n    /** 文件名（URL 上传时可指定扩展名） */\r\n    fileName?: string;\r\n    /** 说明文字，会作为独立文本消息随后发送 */\r\n    caption?: string;\r\n}\n\ninterface WeChatSendAck {\r\n    /** 本地生成的发送回执 ID（微信协议不回传服务端消息 ID） */\r\n    id?: string;\r\n    [key: string]: unknown;\r\n}"
   }
 ]

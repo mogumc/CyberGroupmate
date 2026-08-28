@@ -235,6 +235,7 @@ const PLATFORM_MODULES: Record<string, string> = {
     discord: "discord",
     onebot: "onebot",
     qqbot: "qqbot",
+    wechat: "wechat",
 };
 
 /**

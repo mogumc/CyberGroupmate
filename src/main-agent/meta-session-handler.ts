@@ -291,6 +291,7 @@ async function buildAssignableSkillsRoster(): Promise<string> {
         if (currentConfig.discord) baseSkills.add("discord");
         if ((currentConfig as { onebot?: unknown }).onebot) baseSkills.add("onebot");
         if (currentConfig.qqbot) baseSkills.add("qqbot");
+        if (currentConfig.wechat) baseSkills.add("wechat");
 
         const { getModuleRegistryCache } = await import("../subagent/code-act-executor.js");
         const roster = generateModuleRoster(getModuleRegistryCache(), baseSkills).trim();
@@ -442,7 +443,7 @@ async function buildMetaResolveContext(
 function inferDirectMessageFromChatId(chatId: string): boolean | undefined {
     try {
         const parsed = parseChatId(chatId);
-        if (parsed.platform === "onebot" || parsed.platform === "qqbot") {
+        if (parsed.platform === "onebot" || parsed.platform === "qqbot" || parsed.platform === "wechat") {
             return parsed.rawId.startsWith("private:");
         }
         if (parsed.platform === "telegram") {

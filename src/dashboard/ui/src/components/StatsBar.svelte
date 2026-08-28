@@ -12,6 +12,7 @@
     discord: 'Discord',
     onebot: 'QQ',
     qqbot: 'QQ 官方',
+    wechat: '微信',
   };
 
   const STATE_META = {
@@ -100,6 +101,14 @@
             <span class="text-xs {meta(adapter.state).text}">
               {meta(adapter.state).label}{adapter.reconnectAttempts > 0 ? ` (${adapter.reconnectAttempts})` : ''}
             </span>
+            {#if adapter.qrCodeUrl}
+              <img
+                src={adapter.qrCodeUrl}
+                alt="微信扫码登录"
+                class="w-14 h-14 rounded border border-base-300"
+                title="等待扫码：用手机微信扫描此二维码登录"
+              />
+            {/if}
             {#if adapter.supportsReconnect}
               <button
                 class="btn btn-ghost btn-xs"

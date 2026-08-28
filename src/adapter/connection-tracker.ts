@@ -15,6 +15,7 @@ export class ConnectionTracker {
     private lastConnectedAt: string | null = null;
     private lastError: string | undefined;
     private detail: string | undefined;
+    private qrCodeUrl: string | undefined;
 
     constructor(private readonly platform: string) {}
 
@@ -71,6 +72,11 @@ export class ConnectionTracker {
         this.detail = detail;
     }
 
+    /** 设置/清除待扫码二维码（Data URL）。扫码登录平台在等待扫码时设置，登录成功后清除。 */
+    setQrCodeUrl(url?: string): void {
+        this.qrCodeUrl = url;
+    }
+
     /** 记录错误但不改变连接状态（如库内部可自恢复的错误） */
     noteError(error: string): void {
         this.lastError = error;
@@ -90,6 +96,7 @@ export class ConnectionTracker {
             nextRetryAt: this.nextRetryAt,
             lastConnectedAt: this.lastConnectedAt,
             lastError: this.lastError,
+            qrCodeUrl: this.qrCodeUrl,
         };
     }
 

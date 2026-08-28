@@ -249,6 +249,28 @@ export interface QQBotConfig {
     c2cEnabled?: boolean;
 }
 
+/**
+ * 微信接入（Claw / OpenClaw-weixin 协议，扫码登录）配置。
+ *
+ * 对接 Tencent `@tencent-weixin/openclaw-weixin` 插件所使用的 iLink bot HTTP 协议：
+ * 扫码登录（get_bot_qrcode → get_qrcode_status）换取 bot token，之后
+ * getupdates 长轮询收消息、sendmessage 发消息，媒体经 iLink CDN（AES-128-ECB）加解密。
+ * 独立平台名 "wechat"；chatId 结构：wechat:private:{from_user_id} / wechat:group:{group_id}。
+ */
+export interface WeChatConfig {
+    /** iLink 网关地址（默认 https://ilinkai.weixin.qq.com，一般无需修改；登录响应可能下发 redirect） */
+    apiBaseUrl?: string;
+    /**
+     * 已登录的 bot token（可选）。不填则启动时进入扫码登录流程；
+     * 也可从 openclaw-weixin 插件登录后的凭据中复制 token 直接填入。
+     */
+    token?: string;
+    /** 会话名：登录凭据与轮询游标持久化到 workspace/wechat-session/<name>.json（默认 "default"） */
+    sessionName?: string;
+    /** bot_agent 自我声明（UA 风格，如 "CyberGroupmate/0.1.0"；仅用于腾讯后台观测，不参与鉴权） */
+    botAgent?: string;
+}
+
 export interface ReflectionExternalConfig {
     /** Silence threshold in seconds before triggering reflection (default: 7200 = 2h) */
     silenceThreshold?: number;
@@ -596,6 +618,8 @@ export interface AppConfig {
     onebot?: OneBotConfig;
     /** QQ 官方机器人（开放平台 WebSocket 网关 + REST v2） */
     qqbot?: QQBotConfig;
+    /** 微信个人号（Wechaty 扫码登录） */
+    wechat?: WeChatConfig;
     notification: NotificationConfig;
     reflection: ReflectionExternalConfig;
     contextBudget?: ContextBudgetConfig;
@@ -736,6 +760,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
     const fileDC = (fileConfig.discord ?? {}) as Record<string, unknown>;
     const fileOB = (fileConfig.onebot ?? {}) as Record<string, unknown>;
     const fileQQ = (fileConfig.qqbot ?? {}) as Record<string, unknown>;
+    const fileWX = (fileConfig.wechat ?? {}) as Record<string, unknown>;
     const fileNotification = (fileConfig.notification ?? {}) as Record<string, unknown>;
     const fileReflection = (fileConfig.reflection ?? {}) as Record<string, unknown>;
     const fileMerge = (fileReflection.merge_thresholds ?? {}) as Record<string, unknown>;
@@ -804,6 +829,13 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
             apiBaseUrl: str(fileQQ.api_base_url) ?? undefined,
             authUrl: str(fileQQ.auth_url) ?? undefined,
             c2cEnabled: fileQQ.c2c_enabled != null ? Boolean(fileQQ.c2c_enabled) : undefined,
+        } : undefined,
+        // wechat（Claw/OpenClaw-weixin 协议）配置全字段可选（token 缺省时启动扫码登录），按"节存在"启用
+        wechat: fileConfig.wechat != null ? {
+            apiBaseUrl: str(fileWX.api_base_url) ?? undefined,
+            token: str(fileWX.token) ?? undefined,
+            sessionName: str(fileWX.session_name) ?? undefined,
+            botAgent: str(fileWX.bot_agent) ?? undefined,
         } : undefined,
         notification: {
             mentionKeywords: Array.isArray(fileNotification.mention_keywords)
@@ -1660,6 +1692,16 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (config.qqbot.authUrl) qq.auth_url = config.qqbot.authUrl;
         if (config.qqbot.c2cEnabled != null) qq.c2c_enabled = config.qqbot.c2cEnabled;
         obj.qqbot = qq;
+    }
+
+    // wechat（Claw/OpenClaw-weixin 协议扫码登录；与 onebot/qqbot 相互独立）
+    if (config.wechat) {
+        const wx: Record<string, unknown> = {};
+        if (config.wechat.apiBaseUrl) wx.api_base_url = config.wechat.apiBaseUrl;
+        if (config.wechat.token) wx.token = config.wechat.token;
+        if (config.wechat.sessionName) wx.session_name = config.wechat.sessionName;
+        if (config.wechat.botAgent) wx.bot_agent = config.wechat.botAgent;
+        obj.wechat = wx;
     }
 
     // reflection

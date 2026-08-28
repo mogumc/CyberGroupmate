@@ -32,6 +32,8 @@ export interface AdapterConnectionStatus {
     lastConnectedAt: string | null;
     /** 最近一次错误信息 */
     lastError?: string;
+    /** 待扫码登录的二维码（Data URL）。微信等扫码登录平台在等待扫码时提供；登录成功后清除。 */
+    qrCodeUrl?: string;
     /** adapter 是否支持手动重连（由 dashboard 层填充） */
     supportsReconnect?: boolean;
 }

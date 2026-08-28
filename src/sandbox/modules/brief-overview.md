@@ -202,3 +202,14 @@ modules/vision.d.ts — Vision 视觉模块类型定义 提供图片识别能力
 
 - `see`: 看图：读取一张或多张图片文件，返回每张图片的文字描述。 使用 Vision LLM 分析图片内容，支持 JPEG、PNG、WebP 等常见格式。
 - `see`: 看图（自定义分析）：用指定 prompt 分析图片，而不是默认的"描述内容"。
+
+## wechat
+wechat.d.ts — 微信渠道 API（Claw/OpenClaw-weixin 协议，iLink bot 扫码登录） 系统注入的微信 host proxy 接口。 与 onebot/qq（NapCat）和 qqbot（官方开放平台）完全独立。 平台限制： - 无历史消息 API（离线/断线期间的消息无法补抓；轮询游标已持久化，运行期间不丢消息） - 已读回执不存在；发送语音暂不支持（iLink CDN 需要 silk 编码） - 回复优先走被动回复（入站消息 context_token），无上下文的发送受平台主动消息配额约束
+
+- `sendText`: 发送文本消息。 chatId 来自消息上下文（wechat:private:{from_user_id} 或 wechat:group:{group_id}）。
+- `sendMedia`: 发送媒体消息（图片/视频/语音/文件）。支持公网 URL 与本地路径。
+- `sendFile`: 发送本地文件。
+- `sendTyping`: 微信无 typing 指示，no-op。
+- `getChat`: 获取会话基础信息（群名 / 联系人备注名）。
+- `getMe`: 获取 bot 自身信息（登录账号 id 与昵称）。
+- `downloadMedia`: 取回入站媒体二进制（按 mediaInfo.uniqueFileId，从本地媒体缓存读取）。 返回 { buffer: base64, size }。

@@ -305,6 +305,18 @@
   border: 1px solid color-mix(in srgb, #fa5151 20%, transparent);
 }
 
+.platform-badge.platform-wechat {
+  background: color-mix(in srgb, #07c160 18%, transparent);
+  color: #07c160;
+  border: 1px solid color-mix(in srgb, #07c160 25%, transparent);
+}
+
+[data-theme="light"] .platform-badge.platform-wechat {
+  background: color-mix(in srgb, #07c160 12%, transparent);
+  color: #05934c;
+  border: 1px solid color-mix(in srgb, #07c160 20%, transparent);
+}
+
 .platform-badge.platform-unknown {
   background: color-mix(in srgb, var(--color-base-content) 10%, transparent);
   color: color-mix(in srgb, var(--color-base-content) 50%, transparent);

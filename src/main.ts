@@ -45,6 +45,7 @@ import { TelegramBotApiAdapter } from "./adapter/telegram-botapi-adapter.js";
 import { DiscordAdapter } from "./adapter/discord-adapter.js";
 import { OneBotAdapter } from "./adapter/onebot-adapter.js";
 import { QQBotOfficialAdapter } from "./adapter/qqbot-official-adapter.js";
+import { WeChatAdapter } from "./adapter/wechat-adapter.js";
 import type { PlatformAdapter } from "./adapter/platform-adapter.js";
 import { BackfillCoordinator, resolveBackfillConfig, BACKFILL_FLAG, BACKFILL_STALE_FLAG, BACKFILL_DIRECT_REASON } from "./adapter/backfill.js";
 import { markChatAsRead } from "./adapter/read-receipts.js";
@@ -331,6 +332,13 @@ async function main(): Promise<void> {
             c2cEnabled: appConfig.qqbot.c2cEnabled !== false,
         });
     }
+    if (appConfig.wechat) {
+        log.info("微信配置（Claw/OpenClaw-weixin 协议）", {
+            apiBase: appConfig.wechat.apiBaseUrl ?? "https://ilinkai.weixin.qq.com",
+            token: appConfig.wechat.token ? "✓（免扫码）" : "✗（启动后扫码）",
+            sessionName: appConfig.wechat.sessionName ?? "default",
+        });
+    }
     log.info("全平台入站 Filter", {
         enabled: appConfig.chatFilter?.enabled === true,
         mode: appConfig.chatFilter?.mode ?? "blacklist",
@@ -501,8 +509,14 @@ async function main(): Promise<void> {
         adapters.push(qqbotAdapter);
     }
 
+    if (appConfig.wechat) {
+        // 微信渠道驱动（Claw/OpenClaw-weixin 协议，扫码登录），与 OneBot/qqbot 相互独立
+        const wechatAdapter = new WeChatAdapter(appConfig.wechat, nc, promptUser, sharedMediaDownloader);
+        adapters.push(wechatAdapter);
+    }
+
     if (adapters.length === 0) {
-        throw new Error("至少需要配置一个平台 adapter（telegram / discord / onebot / qqbot）");
+        throw new Error("至少需要配置一个平台 adapter（telegram / discord / onebot / qqbot / wechat）");
     }
 
     // 通用路由函数
