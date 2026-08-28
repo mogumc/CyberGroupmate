@@ -293,6 +293,18 @@
   border: 1px solid color-mix(in srgb, #12b7f5 20%, transparent);
 }
 
+.platform-badge.platform-qqbot {
+  background: color-mix(in srgb, #fa5151 18%, transparent);
+  color: #fa5151;
+  border: 1px solid color-mix(in srgb, #fa5151 25%, transparent);
+}
+
+[data-theme="light"] .platform-badge.platform-qqbot {
+  background: color-mix(in srgb, #fa5151 12%, transparent);
+  color: #c73e3e;
+  border: 1px solid color-mix(in srgb, #fa5151 20%, transparent);
+}
+
 .platform-badge.platform-unknown {
   background: color-mix(in srgb, var(--color-base-content) 10%, transparent);
   color: color-mix(in srgb, var(--color-base-content) 50%, transparent);

@@ -11,6 +11,7 @@
     telegram: 'Telegram',
     discord: 'Discord',
     onebot: 'QQ',
+    qqbot: 'QQ 官方',
   };
 
   const STATE_META = {

@@ -79,7 +79,7 @@
     type="text"
     class="input input-sm input-bordered flex-1"
     bind:value={newChat}
-    placeholder="telegram:-1001234567890 / onebot:private:123456789"
+    placeholder="telegram:-1001234567890 / onebot:private:123456789 / qqbot:private:ABCxyz"
     on:keydown={(e) => e.key === "Enter" && addChat()}
   />
   <button class="btn btn-sm btn-primary" on:click={addChat}>

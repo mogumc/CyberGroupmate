@@ -30,7 +30,9 @@
         class="select select-xs select-bordered w-full"
         bind:value={config.telegram.mode}
       >
-        <option value="bot">bot</option><option value="userbot">userbot</option>
+        <option value="bot">bot (MTProto)</option
+        ><option value="userbot">userbot (MTProto)</option
+        ><option value="botapi">botapi (Bot API over HTTP)</option>
       </select></label
     >
     <label class="cfg-field"
@@ -45,39 +47,70 @@
         on:blur={pwBlur}
       /></label
     >
-    <label class="cfg-field"
-      ><span class="cfg-label"
-        ><i class="fa-solid fa-rotate-right restart-icon"></i> API ID</span
+    {#if config.telegram.mode === 'botapi'}
+      <label class="cfg-field"
+        ><span class="cfg-label"
+          ><i class="fa-solid fa-rotate-right restart-icon"></i> API 根地址 (反代)</span
+        >
+        <input
+          type="text"
+          class="input input-xs input-bordered w-full"
+          bind:value={config.telegram.apiBaseUrl}
+          placeholder="https://api.telegram.org（可填反向代理地址）"
+        /></label
       >
-      <input
-        type="text"
-        class="input input-xs input-bordered w-full"
-        bind:value={config.telegram.apiId}
-      /></label
-    >
-    <label class="cfg-field"
-      ><span class="cfg-label"
-        ><i class="fa-solid fa-rotate-right restart-icon"></i> API Hash</span
+      <label class="cfg-field"
+        ><span class="cfg-label"
+          ><i class="fa-solid fa-rotate-right restart-icon"></i> 长轮询超时 (秒)</span
+        >
+        <input
+          type="number"
+          min="0"
+          max="50"
+          class="input input-xs input-bordered w-full"
+          bind:value={config.telegram.pollTimeoutSec}
+          placeholder="30"
+        /></label
       >
-      <input
-        type="password"
-        class="input input-xs input-bordered w-full"
-        bind:value={config.telegram.apiHash}
-        on:focus={pwFocus}
-        on:blur={pwBlur}
-      /></label
-    >
-    <label class="cfg-field col-span-2"
-      ><span class="cfg-label"
-        ><i class="fa-solid fa-rotate-right restart-icon"></i> 手机号 (userbot)</span
+      <p class="text-xs opacity-50 col-span-2 mb-1">
+        botapi 模式走标准 Bot API over HTTP（getUpdates 长轮询），无需 API ID / API Hash。
+        API 根地址可指向反向代理的 bot.telegram.org（需同时转发 /bot&lt;token&gt;/* 与 /file/bot&lt;token&gt;/*）。
+      </p>
+    {:else}
+      <label class="cfg-field"
+        ><span class="cfg-label"
+          ><i class="fa-solid fa-rotate-right restart-icon"></i> API ID</span
+        >
+        <input
+          type="text"
+          class="input input-xs input-bordered w-full"
+          bind:value={config.telegram.apiId}
+        /></label
       >
-      <input
-        type="text"
-        class="input input-xs input-bordered w-full"
-        bind:value={config.telegram.phone}
-        placeholder="+86..."
-      /></label
-    >
+      <label class="cfg-field"
+        ><span class="cfg-label"
+          ><i class="fa-solid fa-rotate-right restart-icon"></i> API Hash</span
+        >
+        <input
+          type="password"
+          class="input input-xs input-bordered w-full"
+          bind:value={config.telegram.apiHash}
+          on:focus={pwFocus}
+          on:blur={pwBlur}
+        /></label
+      >
+      <label class="cfg-field col-span-2"
+        ><span class="cfg-label"
+          ><i class="fa-solid fa-rotate-right restart-icon"></i> 手机号 (userbot)</span
+        >
+        <input
+          type="text"
+          class="input input-xs input-bordered w-full"
+          bind:value={config.telegram.phone}
+          placeholder="+86..."
+        /></label
+      >
+    {/if}
   </div>
   <div class="divider text-xs opacity-50 my-3">拟人化发送延迟</div>
   <label class="cfg-check mb-2">

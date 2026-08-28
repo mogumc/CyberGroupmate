@@ -9,6 +9,7 @@
   import TelegramTab from "./config/TelegramTab.svelte";
   import DiscordTab from "./config/DiscordTab.svelte";
   import OneBotTab from "./config/OneBotTab.svelte";
+  import QQBotTab from "./config/QQBotTab.svelte";
   import ReflectionTab from "./config/ReflectionTab.svelte";
   import ContextBudgetTab from "./config/ContextBudgetTab.svelte";
   import EmbeddingTab from "./config/EmbeddingTab.svelte";
@@ -34,6 +35,7 @@
   let telegramEnabled = false;
   let discordEnabled = false;
   let onebotEnabled = false;
+  let qqbotEnabled = false;
 
   /** Password 输入框：focus 显示明文，blur 恢复隐藏 */
   function pwFocus(e) { e.target.type = 'text'; }
@@ -57,6 +59,7 @@
     { id: "telegram", label: "Telegram", icon: "fa-paper-plane" },
     { id: "discord", label: "Discord", icon: "fa-gamepad" },
     { id: "onebot", label: "QQ / OneBot", icon: "fa-comments" },
+    { id: "qqbot", label: "QQ 官方 Bot", icon: "fa-robot" },
     { id: "reflection", label: "反思引擎", icon: "fa-brain" },
     { id: "contextBudget", label: "上下文预算", icon: "fa-sliders" },
     { id: "embedding", label: "Embedding", icon: "fa-vector-square" },
@@ -74,9 +77,9 @@
     { id: "envVars", label: "环境变量", icon: "fa-key" },
   ];
 
-  const RESTART_SECTIONS = new Set(["embedding", "privacy", "dashboard", "backgroundAgent", "metrics"]);
+  const RESTART_SECTIONS = new Set(["embedding", "privacy", "dashboard", "backgroundAgent", "metrics", "qqbot"]);
   const RESTART_FIELDS = {
-    telegram: ["mode", "botToken", "apiId", "apiHash", "phone"],
+    telegram: ["mode", "botToken", "apiId", "apiHash", "phone", "apiBaseUrl", "pollTimeoutSec"],
     discord: ["botToken"],
     onebot: ["wsUrl", "selfId", "sendFileAsDataUrl"],
     subagent: ["maxSandboxInstances"],
@@ -145,10 +148,15 @@
       );
       discordEnabled = !!config.discord?.botToken;
       onebotEnabled = !!(config.onebot?.wsUrl && config.onebot?.selfId);
+      qqbotEnabled = !!(config.qqbot?.appId && config.qqbot?.appSecret);
       // 始终确保 UI 有空对象可绑定
       if (!config.telegram) config.telegram = { mode: 'bot', botToken: '', apiId: '', apiHash: '', phone: '' };
+      if (config.telegram.apiBaseUrl == null) config.telegram.apiBaseUrl = '';
+      if (config.telegram.pollTimeoutSec == null) config.telegram.pollTimeoutSec = 30;
       if (!config.discord) config.discord = { botToken: "", applicationId: "" };
       if (!config.onebot) config.onebot = { wsUrl: '', selfId: '', sendFileAsDataUrl: false };
+      if (!config.qqbot) config.qqbot = { appId: '', appSecret: '', apiBaseUrl: '', authUrl: '', c2cEnabled: true };
+      if (config.qqbot.c2cEnabled == null) config.qqbot.c2cEnabled = true;
       if (config.onebot.sendFileAsDataUrl == null) config.onebot.sendFileAsDataUrl = false;
       if (!config.onebot.humanizedDelay) {
         config.onebot.humanizedDelay = {
@@ -200,6 +208,7 @@
       if (!telegramEnabled) delete payload.telegram;
       if (!discordEnabled) delete payload.discord;
       if (!onebotEnabled) delete payload.onebot;
+      if (!qqbotEnabled) delete payload.qqbot;
       const res = await api("/config", { method: "PUT", body: payload });
       if (res.ok) {
         originalConfig = JSON.parse(JSON.stringify(config));
@@ -610,6 +619,8 @@
             <DiscordTab bind:config bind:discordEnabled {pwFocus} {pwBlur} />
           {:else if currentSection === "onebot"}
             <OneBotTab bind:config bind:onebotEnabled />
+          {:else if currentSection === "qqbot"}
+            <QQBotTab bind:config bind:qqbotEnabled {pwFocus} {pwBlur} />
           {:else if currentSection === "reflection"}
             <ReflectionTab bind:config />
           {:else if currentSection === "contextBudget"}

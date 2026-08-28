@@ -1587,6 +1587,8 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             api_hash: config.telegram.apiHash,
             phone: config.telegram.phone,
         };
+        if (config.telegram.apiBaseUrl) tg.api_base_url = config.telegram.apiBaseUrl;
+        if (config.telegram.pollTimeoutSec != null) tg.poll_timeout = config.telegram.pollTimeoutSec;
         if (config.telegram.humanizedDelay) {
             tg.humanized_delay = {
                 enabled: config.telegram.humanizedDelay.enabled,
@@ -1646,6 +1648,18 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             };
         }
         obj.onebot = ob;
+    }
+
+    // qqbot（QQ 官方开放平台；与 onebot 相互独立，可同时启用）
+    if (config.qqbot) {
+        const qq: Record<string, unknown> = {
+            app_id: config.qqbot.appId,
+            app_secret: config.qqbot.appSecret,
+        };
+        if (config.qqbot.apiBaseUrl) qq.api_base_url = config.qqbot.apiBaseUrl;
+        if (config.qqbot.authUrl) qq.auth_url = config.qqbot.authUrl;
+        if (config.qqbot.c2cEnabled != null) qq.c2c_enabled = config.qqbot.c2cEnabled;
+        obj.qqbot = qq;
     }
 
     // reflection

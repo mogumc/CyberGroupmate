@@ -59,6 +59,7 @@ export function platformIcon(platform) {
     case 'telegram': return '✈️';
     case 'discord': return '🎮';
     case 'onebot': return '🐧';
+    case 'qqbot': return '🤖';
     default: return '';
   }
 }
@@ -71,6 +72,7 @@ export function platformLabel(platform) {
     case 'telegram': return 'TG';
     case 'discord': return 'DC';
     case 'onebot': return 'QQ';
+    case 'qqbot': return 'QQ官';
     default: return platform.toUpperCase().slice(0, 2);
   }
 }
