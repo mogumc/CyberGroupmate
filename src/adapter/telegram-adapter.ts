@@ -136,7 +136,7 @@ interface TelegramClientLike {
 type TelegramClientFactory = (config: TelegramConfig) => Promise<TelegramClientLike>;
 
 /** 构造与实时入站完全一致的 NC 消息载荷（补抓路径复用，避免两套字段漂移） */
-function buildTelegramNcMessage(normalized: NormalizedIncomingMessage): Record<string, unknown> {
+export function buildTelegramNcMessage(normalized: NormalizedIncomingMessage): Record<string, unknown> {
     const source = {
         scene: "telegram",
         platform: "telegram",
@@ -244,7 +244,7 @@ interface MeetPeerOptions {
     force?: boolean;
 }
 
-type NormalizedIncomingMessage = {
+export type NormalizedIncomingMessage = {
     chatId: string;
     userId: string;
     displayName: string;
