@@ -1,0 +1,31 @@
+# 统一换行符：仓库与检出一律 LF。
+# 背景：Windows 上编辑器/工具链会把 CRLF 写进工作区，与上游（LF）合并时
+# 会产生整文件级冲突（2026-08 处理 upstream agentic PR 时发生过 4 个文件）。
+* text=auto eol=lf
+
+# Windows 专属脚本保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# pnpm patch 文件必须保持 LF（补丁应用对上下文行尾敏感）
+*.patch text eol=lf -diff
+
+# 二进制文件（禁止任何转换与文本 diff）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.mp3 binary
+*.mp4 binary
+*.zip binary
+*.gz binary
+*.pdf binary
+*.wasm binary
+*.node binary
