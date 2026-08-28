@@ -332,12 +332,13 @@ export class WeChatAdapter implements PlatformAdapter {
         for (let qrRound = 1; qrRound <= QR_REFRESH_MAX; qrRound++) {
             if (!isCurrent()) return;
 
-            // 1. 取二维码
-            const qrResp = await this.apiPostRaw("ilink/bot/get_bot_qrcode?bot_type=" + BOT_TYPE, {
+            // 1. 取二维码（apiPostRaw 返回原始文本，此处手动解析）
+            const qrRaw = await this.apiPostRaw("ilink/bot/get_bot_qrcode?bot_type=" + BOT_TYPE, {
                 local_token_list: [],
-            }, currentBase) as QRCodeResponse;
+            }, currentBase);
+            const qrResp = JSON.parse(qrRaw) as QRCodeResponse;
             if (!qrResp?.qrcode || !qrResp?.qrcode_img_content) {
-                throw new Error("获取登录二维码失败（get_bot_qrcode 未返回 qrcode）");
+                throw new Error(`获取登录二维码失败（get_bot_qrcode 未返回 qrcode）: ${qrRaw.slice(0, 200)}`);
             }
             log.info("已获取微信登录二维码", { round: qrRound });
 
