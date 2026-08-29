@@ -8,7 +8,8 @@
  *   （wait/scaned/need_verifycode/expired/scaned_but_redirect/confirmed），confirmed 后拿到
  *   bot_token + baseurl。二维码同步打印到终端并写入连接状态（Dashboard 展示）。
  * - 收消息：POST ilink/bot/getupdates 长轮询（get_updates_buf 游标持久化，重启不重放）
- * - 发消息：POST ilink/bot/sendmessage（message_type=BOT，携带入站消息的 context_token）
+ * - 发消息：POST ilink/bot/sendmessage（message_type=BOT，被动回复必须携带最新 context_token；
+ *   token 随每条下发消息更新——含 BOT 回显——陈旧/缺失 token 服务端会静默丢弃且 ret=0）
  * - 媒体：入站经 CDN（full_url 或 /download?encrypted_query_param=...）下载 + AES-128-ECB 解密；
  *   出站 getuploadurl 取预签名 → AES-ECB 加密 POST 上传 → x-encrypted-param 回填媒体引用
  * - typing：getconfig 拿 typing_ticket → sendtyping
@@ -126,6 +127,7 @@ interface PersistedSession {
     baseUrl: string;
     ilinkBotId?: string;
     getUpdatesBuf?: string;
+    contextTokens?: Record<string, { token: string; receivedAt: number }>;
     savedAt: string;
 }
 
@@ -191,8 +193,9 @@ export class WeChatAdapter implements PlatformAdapter {
     private baseUrl: string = DEFAULT_BASE_URL;
     private getUpdatesBuf = "";
 
-    /** chatId → 最近入站消息的 context_token（发送回复用） */
+    /** chatId → 最新 context_token（发送回复用；随所有下发消息刷新，含 BOT 回显） */
     private contextTokens = new Map<string, { token: string; receivedAt: number }>();
+    private contextTokensDirty = false;
     /** chatId → 回复对端（from_user_id） */
     private peers = new Map<string, string>();
     /** chatId → typing_ticket（getconfig 获取，短期复用） */
@@ -418,6 +421,7 @@ export class WeChatAdapter implements PlatformAdapter {
                     this.token = statusResp.bot_token;
                     this.baseUrl = (statusResp.baseurl?.trim() || currentBase).replace(/\/+$/, "");
                     this.getUpdatesBuf = "";
+                    this.contextTokens.clear();
                     this.connection.setQrCodeUrl(undefined);
                     this.persistSession(statusResp.ilink_bot_id);
                     this.reconnectAttempts = 0;
@@ -450,10 +454,12 @@ export class WeChatAdapter implements PlatformAdapter {
                 baseUrl: this.baseUrl,
                 ilinkBotId,
                 getUpdatesBuf: this.getUpdatesBuf,
+                contextTokens: Object.fromEntries(this.contextTokens),
                 savedAt: new Date().toISOString(),
             };
             fs.mkdirSync(path.dirname(this.sessionPath), { recursive: true });
             fs.writeFileSync(this.sessionPath, JSON.stringify(session, null, 2));
+            this.contextTokensDirty = false;
         } catch (err) {
             log.warn("微信会话凭据保存失败", { error: String(err).slice(0, 120) });
         }
@@ -467,7 +473,14 @@ export class WeChatAdapter implements PlatformAdapter {
                 this.token = session.token.trim();
                 if (session.baseUrl?.trim()) this.baseUrl = session.baseUrl.trim().replace(/\/+$/, "");
                 this.getUpdatesBuf = session.getUpdatesBuf ?? "";
-                log.info("已加载持久化的微信登录凭据", { savedAt: session.savedAt });
+                if (session.contextTokens && typeof session.contextTokens === "object") {
+                    for (const [chatId, entry] of Object.entries(session.contextTokens)) {
+                        if (entry && typeof entry.token === "string" && entry.token.trim()) {
+                            this.contextTokens.set(chatId, { token: entry.token.trim(), receivedAt: entry.receivedAt ?? 0 });
+                        }
+                    }
+                }
+                log.info("已加载持久化的微信登录凭据", { savedAt: session.savedAt, contextTokens: this.contextTokens.size });
             }
         } catch (err) {
             log.warn("读取微信会话凭据失败", { error: String(err).slice(0, 120) });
@@ -477,6 +490,7 @@ export class WeChatAdapter implements PlatformAdapter {
     private clearSession(): void {
         this.token = null;
         this.getUpdatesBuf = "";
+        this.contextTokens.clear();
         try {
             if (fs.existsSync(this.sessionPath)) fs.unlinkSync(this.sessionPath);
         } catch { /* ignore */ }
@@ -578,8 +592,13 @@ export class WeChatAdapter implements PlatformAdapter {
                             log.warn("处理微信消息失败", { messageId: msg.message_id, error: String(err).slice(0, 200) });
                         }
                     }
+                    let cursorChanged = false;
                     if (typeof resp.get_updates_buf === "string" && resp.get_updates_buf !== this.getUpdatesBuf) {
                         this.getUpdatesBuf = resp.get_updates_buf;
+                        cursorChanged = true;
+                    }
+                    // 游标或回复上下文 token 变化时落盘（token 持久化保证重启后仍可被动回复）
+                    if (cursorChanged || this.contextTokensDirty) {
                         this.persistSession();
                     }
                 } catch (err) {
@@ -612,7 +631,30 @@ export class WeChatAdapter implements PlatformAdapter {
 
     // ─── 入站消息处理 ───
 
+    /**
+     * 从任何下发消息捕获最新 context_token（用户消息 + BOT 回显）。
+     * 回显消息的会话键取 to_user_id（收件人即聊天对端）；用户消息沿用 from_user_id。
+     */
+    private captureContextToken(msg: WeixinMsg): void {
+        const token = String(msg.context_token ?? "").trim();
+        if (!token) return;
+        const isFromUser = msg.message_type == null || msg.message_type === MSG_TYPE.USER;
+        const peerId = String((isFromUser ? msg.from_user_id : (msg.to_user_id || msg.from_user_id)) ?? "").trim();
+        if (!peerId && !msg.group_id) return;
+        const chatId = msg.group_id
+            ? composeChatId("wechat", "group", String(msg.group_id))
+            : composeChatId("wechat", "private", peerId);
+        if (this.contextTokens.get(chatId)?.token === token) return;
+        this.contextTokens.set(chatId, { token, receivedAt: Date.now() });
+        this.contextTokensDirty = true;
+        log.debug("更新微信回复上下文 token", { chatId, source: isFromUser ? "user_message" : "bot_echo" });
+    }
+
     private async processMessage(msg: WeixinMsg): Promise<void> {
+        // context_token 随每条下发消息更新（含 BOT 回显）：服务端为被动回复语义，
+        // 回复必须携带最新 token，陈旧 token 会被静默丢弃（ret=0 但不投递）
+        this.captureContextToken(msg);
+
         // 只处理用户消息（BOT 类型是自己的下发回执/回显）
         if (msg.message_type != null && msg.message_type !== MSG_TYPE.USER) return;
         const fromUserId = String(msg.from_user_id ?? "").trim();
@@ -624,11 +666,8 @@ export class WeChatAdapter implements PlatformAdapter {
             : composeChatId("wechat", "private", fromUserId);
         const messageId = String(msg.message_id);
 
-        // 登记回复上下文
+        // 登记回复对端（context_token 已在 captureContextToken 统一登记）
         this.peers.set(chatId, fromUserId);
-        if (msg.context_token) {
-            this.contextTokens.set(chatId, { token: msg.context_token, receivedAt: Date.now() });
-        }
 
         if (shouldDropInbound(loadConfig().chatFilter, { chatId, userId: composeChatId("wechat", fromUserId) })) return;
         if (userGate.shouldDrop(composeChatId("wechat", fromUserId))) return;
@@ -849,27 +888,24 @@ export class WeChatAdapter implements PlatformAdapter {
     }
 
     private async sendMessageReq(body: Record<string, unknown>): Promise<void> {
-        const resp = await this.apiPost<{ ret?: number; errmsg?: string }>("ilink/bot/sendmessage", body);
-        if (resp.ret != null && resp.ret !== 0) {
-            throw new Error(`sendmessage ret=${resp.ret} errmsg=${resp.errmsg ?? "(none)"}`);
+        const resp = await this.apiPost<{ ret?: number; errcode?: number; errmsg?: string }>("ilink/bot/sendmessage", body);
+        // ret 与 errcode 任一非零都视为失败（与 AstrBot _is_successful_api_payload 对齐），
+        // 否则服务端拒收会被当成发送成功
+        const ret = resp.ret ?? 0;
+        const errcode = resp.errcode ?? 0;
+        if (ret !== 0 || errcode !== 0) {
+            throw new Error(`sendmessage 失败 ret=${ret} errcode=${errcode} errmsg=${resp.errmsg ?? "(none)"}`);
         }
     }
 
     private async sendTextTo(chatId: string, text: string): Promise<{ id: string; text: string }> {
         const peerId = this.peers.get(chatId) ?? this.peerFromChatId(chatId);
         const context = this.contextTokens.get(chatId)?.token;
-        const body = this.buildTextReq(peerId, text, context);
-        try {
-            await this.sendMessageReq(body);
-        } catch (err) {
-            if (context) {
-                // context_token 可能已过期：去掉上下文重试一次（可能被平台按主动消息限额处理）
-                log.warn("sendmessage 携带 context_token 失败，重试无上下文发送", { chatId, error: String(err).slice(0, 150) });
-                await this.sendMessageReq(this.buildTextReq(peerId, text));
-            } else {
-                throw err;
-            }
+        if (!context) {
+            // 无 token 的发送服务端会静默丢弃（不投递但返回成功），必须显式报错
+            throw new Error(`wechat.sendText: 无可用 context_token（chat=${chatId}）。微信 iLink 为被动回复语义，请等待对方先发来一条消息后再回复`);
         }
+        await this.sendMessageReq(this.buildTextReq(peerId, text, context));
         return { id: `wechat_${Date.now().toString(36)}`, text };
     }
 
@@ -1057,6 +1093,9 @@ export class WeChatAdapter implements PlatformAdapter {
     private async sendMediaTo(chatId: string, media: Record<string, unknown>): Promise<{ id: string; text: string }> {
         const peerId = this.peers.get(chatId) ?? this.peerFromChatId(chatId);
         const context = this.contextTokens.get(chatId)?.token;
+        if (!context) {
+            throw new Error(`wechat.sendMedia: 无可用 context_token（chat=${chatId}）。微信 iLink 为被动回复语义，请等待对方先发来一条消息后再回复`);
+        }
 
         // ── 解析来源 ──
         let buffer: Buffer;
@@ -1157,7 +1196,7 @@ export class WeChatAdapter implements PlatformAdapter {
                 message_type: MSG_TYPE.BOT,
                 message_state: MSG_STATE.FINISH,
                 item_list: [item],
-                ...(context ? { context_token: context } : {}),
+                context_token: context,
             },
         };
         await this.sendMessageReq(body);
