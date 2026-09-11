@@ -5,6 +5,7 @@
  * - 将下载的媒体 Buffer 按类型保存到 workspace/Downloads/
  * - 按 uniqueFileId 去重（已存在则跳过）；贴纸额外按文件内容去重
  * - 3 天（可配）自动清理过期文件
+ * - 主动垃圾清理（cleanupCache）：按类型删除模型下载的文件；贴纸默认白名单，需显式指定才清理
  *
  * 目录结构：
  *   workspace/Downloads/
@@ -26,6 +27,31 @@ const log = createLogger("media-downloader");
 // ─── 类型 ───
 
 export type MediaCategory = "photos" | "videos" | "stickers" | "documents" | "other";
+
+/** 缓存统计/清理的类别键：媒体分类 + "root"（Downloads 根目录散落文件） */
+export type CacheCategoryKey = MediaCategory | "root";
+
+export interface CacheCategoryStat {
+    key: CacheCategoryKey;
+    /** 文件数 */
+    files: number;
+    /** 总字节数 */
+    bytes: number;
+}
+
+export interface CacheStats {
+    /** 下载根目录绝对路径 */
+    dir: string;
+    totalFiles: number;
+    totalBytes: number;
+    /** 分类型统计（stickers 单独列项） */
+    categories: CacheCategoryStat[];
+}
+
+export interface CacheCleanupResult {
+    /** 各类型实际清理明细（files/bytes 为实际删除数） */
+    deleted: CacheCategoryStat[];
+}
 
 export interface MediaFileInfo {
     /** 磁盘绝对路径 */
@@ -65,6 +91,11 @@ const DEFAULT_DOWNLOAD_DIR = "workspace/Downloads";
 const DEFAULT_RETENTION_DAYS = 3;
 const DEFAULT_MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+/** 缓存统计/清理的全部类别键（stickers 最后，单独列项） */
+export const CACHE_CATEGORY_KEYS: CacheCategoryKey[] = ["photos", "videos", "documents", "other", "root", "stickers"];
+/** cleanupCache 默认清理范围：除贴纸外全部（贴纸是永久资源，需显式指定才会清理） */
+const DEFAULT_CLEANUP_KEYS: CacheCategoryKey[] = ["photos", "videos", "documents", "other", "root"];
 
 /** mediaType → 分类目录 */
 function categorize(mediaType: string): MediaCategory {
@@ -324,13 +355,7 @@ export class MediaDownloader {
                         if (stat.isFile() && stat.mtimeMs < cutoffMs) {
                             fs.unlinkSync(filePath);
                             removed++;
-                            // 从索引中移除
-                            for (const [key, val] of this.pathIndex.entries()) {
-                                if (val === filePath) {
-                                    this.pathIndex.delete(key);
-                                    break;
-                                }
-                            }
+                            this.removePathFromIndexes(filePath);
                         }
                     } catch { /* skip individual files */ }
                 }
@@ -341,6 +366,126 @@ export class MediaDownloader {
             this.saveManifest();
             log.info("cleanupExpired: 已清理过期文件", { removed, retentionDays: this.retentionDays });
         }
+    }
+
+    /**
+     * 汇总缓存占用：各分类目录（含子目录，如 other/qq-converted）+ Downloads 根目录散落文件。
+     * stickers 单独列项，便于按类型展示与选择性清理。
+     */
+    getCacheStats(): CacheStats {
+        const categories = CACHE_CATEGORY_KEYS.map((key) => {
+            const files = this.listCacheFiles(key);
+            return {
+                key,
+                files: files.length,
+                bytes: files.reduce((sum, file) => sum + file.bytes, 0),
+            };
+        });
+        return {
+            dir: this.downloadDir,
+            totalFiles: categories.reduce((sum, category) => sum + category.files, 0),
+            totalBytes: categories.reduce((sum, category) => sum + category.bytes, 0),
+            categories,
+        };
+    }
+
+    /**
+     * 主动垃圾清理：删除模型下载/落盘的文件。
+     *
+     * - categories 省略 → 默认清理除贴纸外的全部（photos/videos/documents/other/root）
+     * - categories 传入数组 → 只清理列出的类型；空数组不清理任何内容（防误操作）
+     * - 覆盖分类目录（含子目录）与 Downloads 根目录散落文件；跳过 `_` 前缀内部文件（如 _manifest.json）
+     * - 贴纸是永久资源，需显式传入 "stickers" 才会清理；清理后模型将无法再发送对应贴纸
+     * - 被删文件同步从 manifest 与贴纸索引（含内容去重别名）中移除
+     */
+    cleanupCache(categories?: CacheCategoryKey[]): CacheCleanupResult {
+        const keys = categories === undefined
+            ? DEFAULT_CLEANUP_KEYS
+            : categories.filter((key) => CACHE_CATEGORY_KEYS.includes(key));
+        const deleted: CacheCategoryStat[] = [];
+
+        for (const key of keys) {
+            const files = this.listCacheFiles(key);
+            let removed = 0;
+            let bytes = 0;
+            for (const file of files) {
+                try {
+                    fs.unlinkSync(file.path);
+                    removed++;
+                    bytes += file.bytes;
+                    this.removePathFromIndexes(file.path);
+                } catch { /* 单个文件删除失败不影响其余 */ }
+            }
+            deleted.push({ key, files: removed, bytes });
+        }
+
+        const totalRemoved = deleted.reduce((sum, entry) => sum + entry.files, 0);
+        if (totalRemoved > 0) {
+            this.saveManifest();
+            log.info("cleanupCache: 已清理缓存文件", {
+                removed: totalRemoved,
+                detail: deleted.filter((entry) => entry.files > 0).map((entry) => `${entry.key}:${entry.files}`).join(","),
+            });
+        }
+        return { deleted };
+    }
+
+    /**
+     * 列出某类别下的全部缓存文件。
+     * root 仅扫 Downloads 根目录直接子文件；其余分类递归扫子目录（如 other/qq-converted）。
+     * 跳过 `_` 前缀内部文件与符号链接。
+     */
+    private listCacheFiles(key: CacheCategoryKey): Array<{ path: string; bytes: number }> {
+        const result: Array<{ path: string; bytes: number }> = [];
+
+        if (key === "root") {
+            for (const entry of this.readdirSafe(this.downloadDir)) {
+                if (entry.name.startsWith("_") || !entry.isFile()) continue;
+                const filePath = path.join(this.downloadDir, entry.name);
+                try {
+                    result.push({ path: filePath, bytes: fs.statSync(filePath).size });
+                } catch { /* skip */ }
+            }
+            return result;
+        }
+
+        const stack = [path.join(this.downloadDir, key)];
+        while (stack.length > 0) {
+            const dir = stack.pop()!;
+            for (const entry of this.readdirSafe(dir)) {
+                if (entry.name.startsWith("_")) continue;
+                const entryPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    stack.push(entryPath);
+                } else if (entry.isFile()) {
+                    try {
+                        result.push({ path: entryPath, bytes: fs.statSync(entryPath).size });
+                    } catch { /* skip */ }
+                }
+            }
+        }
+        return result;
+    }
+
+    private readdirSafe(dir: string): fs.Dirent[] {
+        try {
+            return fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            return []; // 目录不存在或不可读
+        }
+    }
+
+    /** 文件被删除后同步清理内存索引（含同路径的贴纸内容去重别名）。 */
+    private removePathFromIndexes(filePath: string): void {
+        for (const [uniqueFileId, indexedPath] of Array.from(this.pathIndex.entries())) {
+            if (indexedPath !== filePath) continue;
+            this.pathIndex.delete(uniqueFileId);
+            this.stickerAliasContentHashes.delete(uniqueFileId);
+        }
+        for (const [hash, indexedPath] of Array.from(this.stickerContentIndex.entries())) {
+            if (indexedPath === filePath) this.stickerContentIndex.delete(hash);
+        }
+        this.indexedStickerPaths.delete(filePath);
     }
 
     private loadManifest(): boolean {

@@ -38,6 +38,7 @@ import { getPlatform } from "../core/chat-id.js";
 import { releaseChatFromFilter, shouldDropInbound } from "../core/inbound-filter.js";
 import { resolveBackfillConfig } from "../adapter/backfill.js";
 import { extractAnimatedStickerFrames } from "../core/vision-processor.js";
+import { CACHE_CATEGORY_KEYS, type CacheCategoryKey } from "../core/media-downloader.js";
 import type { MainAgentGlobalState, SchedulerEvent, SessionDigestEntry } from "../subagent/types.js";
 import { createCronApi, createReminderApi } from "../meta-sandbox/meta-api/scheduler.js";
 import { createTodoApi } from "../meta-sandbox/meta-api/todo.js";
@@ -1649,6 +1650,54 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         res.json({ ok: true });
     });
 
+
+    // ─── Downloads 文件缓存 / 垃圾清理 ───
+
+    /** 文件缓存统计：按类型（photos/videos/documents/other/root/stickers）汇总文件数与大小，贴纸单独列项 */
+    router.get("/downloads/cache", (_req, res) => {
+        if (!deps.mediaDownloader) { res.status(503).json({ error: "mediaDownloader not available" }); return; }
+        try {
+            res.json({ ok: true, ...deps.mediaDownloader.getCacheStats() });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    /**
+     * 主动垃圾清理：删除模型下载/落盘的文件。
+     * categories 省略 → 默认清理除贴纸外的全部；显式传入则只清理列出类型（贴纸需显式选择，会影响模型发送贴纸）。
+     */
+    router.post("/downloads/cleanup", (req, res) => {
+        if (!deps.mediaDownloader) { res.status(503).json({ error: "mediaDownloader not available" }); return; }
+        const rawCategories = req.body?.categories;
+        if (rawCategories !== undefined && !Array.isArray(rawCategories)) {
+            res.status(400).json({ error: "categories 必须是数组" });
+            return;
+        }
+        if (Array.isArray(rawCategories)) {
+            const invalid = rawCategories.filter((key) => !CACHE_CATEGORY_KEYS.includes(String(key) as CacheCategoryKey));
+            if (invalid.length > 0) {
+                res.status(400).json({
+                    error: `非法分类: ${invalid.join(", ")}（可选: ${CACHE_CATEGORY_KEYS.join(", ")}）`,
+                });
+                return;
+            }
+        }
+        try {
+            const categories = rawCategories === undefined
+                ? undefined
+                : rawCategories.map(String) as CacheCategoryKey[];
+            const result = deps.mediaDownloader.cleanupCache(categories);
+            const cleaned = result.deleted.filter((entry) => entry.files > 0);
+            log.info("downloads 垃圾清理完成", {
+                requested: categories?.join(",") ?? "default(除贴纸外全部)",
+                cleaned: cleaned.map((entry) => `${entry.key}:${entry.files}`).join(",") || "(nothing)",
+            });
+            res.json({ ok: true, deleted: result.deleted, stats: deps.mediaDownloader.getCacheStats() });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
 
     // ─── Memory: List / Edit / Delete ───
 

@@ -18,6 +18,7 @@
   import TokenStatsPanel from './panels/TokenStatsPanel.svelte';
   import MemoryPanel from './panels/MemoryPanel.svelte';
   import StickersPanel from './panels/StickersPanel.svelte';
+  import FileCachePanel from './panels/FileCachePanel.svelte';
   import SkillsPanel from './panels/SkillsPanel.svelte';
   import SchedulerPanel from './panels/SchedulerPanel.svelte';
   import SystemPanel from './panels/SystemPanel.svelte';
@@ -73,6 +74,7 @@
     <div class:hidden={$activeTab !== 'token-stats'}><TokenStatsPanel /></div>
     <div class:hidden={$activeTab !== 'memory'}><MemoryPanel /></div>
     <div class:hidden={$activeTab !== 'stickers'}><StickersPanel /></div>
+    <div class:hidden={$activeTab !== 'file-cache'}><FileCachePanel /></div>
     <div class:hidden={$activeTab !== 'skills'}><SkillsPanel /></div>
     <div class:hidden={$activeTab !== 'scheduler'}><SchedulerPanel /></div>
     <div class:hidden={$activeTab !== 'system'}><SystemPanel /></div>
