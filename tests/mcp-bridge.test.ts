@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { readFileSync, rmSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
+    autoReconnect,
     disconnectAll,
     getConnectionConfigs,
     getMcpModuleEntries,
@@ -470,6 +474,114 @@ describe("mcp-bridge Streamable HTTP", () => {
         } finally {
             delete process.env.ZAI_TEST_KEY;
             await disconnectAll();
+            await new Promise<void>((resolve, reject) => {
+                server.close((err) => (err ? reject(err) : resolve()));
+            });
+        }
+    });
+
+    it("keeps configs when a server fails to reconnect (restart / connect failure must not drop them)", async () => {
+        const tmpDir = mkdtempSync(join(tmpdir(), "cgm-mcp-persist-"));
+        const persistPath = join(tmpDir, "mcp-connections.json");
+
+        let serverUrl = "";
+
+        // 一个可用的 mock server；另一个配置指向必然拒绝连接的端口（127.0.0.1:1）。
+        const server = createServer(async (req, res) => {
+            if (req.method !== "POST") {
+                res.writeHead(405);
+                res.end();
+                return;
+            }
+
+            const body = await readBody(req);
+            const msg = JSON.parse(body) as { id?: number; method?: string };
+
+            if (msg.method === "initialize") {
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: {
+                        protocolVersion: "2025-03-26",
+                        capabilities: { tools: {} },
+                        serverInfo: { name: "mock-mcp", version: "1.0.0" },
+                    },
+                }, { "Mcp-Session-Id": "sess-persist" });
+                return;
+            }
+            if (msg.method === "notifications/initialized") {
+                res.writeHead(202);
+                res.end();
+                return;
+            }
+            if (msg.method === "tools/list") {
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: { tools: [{ name: "ping", description: "Ping tool" }] },
+                });
+                return;
+            }
+            res.writeHead(404);
+            res.end();
+        });
+
+        await new Promise<void>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+                const address = server.address();
+                if (!address || typeof address === "string") throw new Error("Failed to bind mock MCP server");
+                serverUrl = `http://127.0.0.1:${address.port}/mcp`;
+                resolve();
+            });
+        });
+
+        const readPersistedNames = (): string[] =>
+            (JSON.parse(readFileSync(persistPath, "utf-8")) as Array<{ name?: string }>)
+                .map((config) => String(config.name))
+                .sort();
+
+        try {
+            // 模拟重启前落盘的配置：一个可用 + 一个暂时不可达。
+            // 顺序刻意让"可用"排在前面——修复前它的成功重连会触发落盘，把后面尚未重连的配置覆盖删除。
+            writeFileSync(persistPath, JSON.stringify([
+                { name: "up-http", transport: "streamable-http", url: serverUrl },
+                { name: "down-http", transport: "streamable-http", url: "http://127.0.0.1:1/mcp" },
+            ], null, 2), "utf-8");
+
+            initMcpBridge({ persistPath });
+            await autoReconnect();
+
+            // 关键回归：一个成功、一个失败，两个配置都必须留在持久化文件里。
+            assert.deepEqual(readPersistedNames(), ["down-http", "up-http"]);
+            assert.deepEqual(getConnectionConfigs().map((config) => config.name).sort(), ["down-http", "up-http"]);
+
+            // 连接失败的 server 仍会出现在列表里（running: false），配置不"隐身"。
+            const listed = mcpBridge.list();
+            assert.equal(listed.find((entry) => entry.name === "up-http")?.running, true);
+            assert.equal(listed.find((entry) => entry.name === "down-http")?.running, false);
+
+            // 其他 server 成功连接触发的落盘，也不能冲掉失败的那条配置。
+            await mcpBridge.connect({ name: "extra-http", transport: "streamable-http", url: serverUrl });
+            assert.ok(readPersistedNames().includes("down-http"), "later saves must keep the failed server config");
+
+            // 新增配置即使本次连接失败也必须保留（服务重新上线 / 重启后会继续重试）。
+            await assert.rejects(mcpBridge.connect({
+                name: "newly-down",
+                transport: "streamable-http",
+                url: "http://127.0.0.1:1/mcp",
+            }));
+            assert.ok(readPersistedNames().includes("newly-down"), "failed connect must still persist the config");
+
+            // 只有显式 disconnect 才会移除配置。
+            await mcpBridge.disconnect("down-http");
+            assert.ok(!readPersistedNames().includes("down-http"), "explicit disconnect removes the config");
+        } finally {
+            await disconnectAll();
+            try {
+                rmSync(tmpDir, { recursive: true, force: true });
+            } catch {
+                // 临时目录清理失败不影响测试结论
+            }
             await new Promise<void>((resolve, reject) => {
                 server.close((err) => (err ? reject(err) : resolve()));
             });

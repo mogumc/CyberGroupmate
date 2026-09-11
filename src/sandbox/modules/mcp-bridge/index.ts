@@ -6,8 +6,12 @@
  * - stdio：启动本地 MCP Server 子进程，通过 stdin/stdout 进行 JSON-RPC
  * - Streamable HTTP：对远端 MCP endpoint 发起 HTTP POST，请求结果可为 JSON 或 SSE
  *
- * 连接信息持久化到 workspace/<chatId>/mcp-connections.json，
- * Worker 重建时自动重连。
+ * 连接信息全局持久化到 workspace/mcp-connections.json（所有 sandbox / subagent 共享），
+ * 进程重启时自动重连。
+ *
+ * 持久化语义：落盘的是「期望安装的配置」（desiredConfigs），与连接状态解耦——
+ * 连接失败 / 重连失败都不会删除配置（下次启动继续重试），
+ * 只有显式 disconnect()（或全量替换配置）才会移除。避免一次网络抖动导致 MCP 永久失效。
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -100,6 +104,16 @@ export interface McpServerInfo {
 
 const connections = new Map<string, McpConnection>();
 
+/**
+ * 期望配置（用户意图）：持久化文件与 getConnectionConfigs() 的唯一来源，与运行状态解耦。
+ * 只有这些操作会修改它：
+ * - connect(config)：新增 / 更新
+ * - 显式 disconnect(name)：移除
+ * - replaceConnectionConfigs(configs)：全量替换
+ * 连接失败、重连失败都不动它，避免配置被误删导致 MCP 永久失效。
+ */
+const desiredConfigs = new Map<string, McpServerConfig>();
+
 /** 持久化路径（由外部设置） */
 let persistPath = "";
 
@@ -121,7 +135,9 @@ const SSE_CONTENT_TYPE = "text/event-stream";
 function loadPersistedConnections(): McpServerConfig[] {
     if (!persistPath || !existsSync(persistPath)) return [];
     try {
-        return JSON.parse(readFileSync(persistPath, "utf-8"));
+        const parsed = JSON.parse(readFileSync(persistPath, "utf-8"));
+        // 文件被手工改坏时按空处理，避免启动重连直接抛错。
+        return Array.isArray(parsed) ? parsed as McpServerConfig[] : [];
     } catch {
         return [];
     }
@@ -129,7 +145,8 @@ function loadPersistedConnections(): McpServerConfig[] {
 
 function saveConnectionConfigs(): void {
     if (!persistPath) return;
-    const configs = Array.from(connections.values()).map((connection) => connection.config);
+    // 落盘的是期望配置而非当前活连接：连接失败不会导致配置从文件里消失。
+    const configs = Array.from(desiredConfigs.values());
     try {
         const dir = dirname(persistPath);
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -140,7 +157,7 @@ function saveConnectionConfigs(): void {
 }
 
 function listConnectionsLocal(): McpServerInfo[] {
-    return Array.from(connections.entries()).map(([name, conn]) => ({
+    const result: McpServerInfo[] = Array.from(connections.entries()).map(([name, conn]) => ({
         name,
         description: conn.config.description,
         transport: conn.transportKind,
@@ -148,6 +165,20 @@ function listConnectionsLocal(): McpServerInfo[] {
         tools: conn.tools.map((tool) => tool.name),
         running: conn.transportKind === "streamable-http" ? true : !!conn.process,
     }));
+    // 已配置但当前未连接的 server 也列出（running: false），配置不"隐身"：
+    // 连接失败时用户仍能在 dashboard 看到、编辑或卸载它。
+    for (const [name, config] of desiredConfigs) {
+        if (connections.has(name)) continue;
+        result.push({
+            name,
+            description: config.description,
+            transport: getTransportKind(config),
+            url: config.url,
+            tools: [],
+            running: false,
+        });
+    }
+    return result;
 }
 
 function cloneServerList(list: McpServerInfo[]): McpServerInfo[] {
@@ -584,7 +615,8 @@ async function initializeConnection(conn: McpConnection): Promise<void> {
 
 async function connectServer(config: McpServerConfig): Promise<McpConnection> {
     if (connections.has(config.name)) {
-        await disconnectServer(config.name);
+        // 同名重连：只关活连接，不动期望配置（失败也不能丢配置）。
+        await closeLiveConnection(config.name);
     }
 
     const conn = createConnection(config);
@@ -636,13 +668,13 @@ async function connectServer(config: McpServerConfig): Promise<McpConnection> {
     }
 
     connections.set(config.name, conn);
-    saveConnectionConfigs();
     onRegistryChange?.();
 
     return conn;
 }
 
-async function disconnectServer(name: string): Promise<void> {
+/** 仅关闭活连接（不触碰期望配置，不落盘）。 */
+async function closeLiveConnection(name: string): Promise<void> {
     const conn = connections.get(name);
     if (!conn) return;
 
@@ -665,8 +697,14 @@ async function disconnectServer(name: string): Promise<void> {
     }
 
     connections.delete(name);
-    saveConnectionConfigs();
     onRegistryChange?.();
+}
+
+/** 用户显式卸载：关闭连接并从期望配置中移除（移除会落盘）。 */
+async function disconnectServer(name: string): Promise<void> {
+    desiredConfigs.delete(name);
+    saveConnectionConfigs();
+    await closeLiveConnection(name);
 }
 
 async function callTool(serverName: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {
@@ -765,6 +803,11 @@ export const mcpBridge = {
                     proxyCallbacks!.callHost("mcp.call", [connected.name, toolName, args]),
             };
         }
+        validateConfig(config);
+        // 期望配置先落盘（意图优先）：即使本次连接失败，配置也保留并会在下次启动重连，
+        // 不会因为一次网络抖动 / 服务未就绪就被从 config 里删掉。
+        desiredConfigs.set(config.name, config);
+        saveConnectionConfigs();
         const conn = await connectServer(config);
         return {
             name: conn.config.name,
@@ -805,6 +848,9 @@ export function initMcpBridge(options: {
 }): void {
     persistPath = options.persistPath;
     onRegistryChange = options.onRegistryChange ?? null;
+    // 重新初始化视为全新运行时（进程启动 / 测试重置）：清空内存态，配置以 persistPath 文件为准。
+    connections.clear();
+    desiredConfigs.clear();
 }
 
 export function setMcpProxyCallbacks(callbacks: McpProxyCallbacks | null): void {
@@ -816,32 +862,54 @@ export function setMcpListSnapshot(servers: McpServerInfo[]): void {
 }
 
 export function getConnectionConfigs(): McpServerConfig[] {
-    return Array.from(connections.values()).map((connection) => ({
-        name: connection.config.name,
-        ...(connection.config.description ? { description: connection.config.description } : {}),
-        ...(connection.config.transport ? { transport: connection.config.transport } : {}),
-        ...(connection.config.command ? { command: connection.config.command } : {}),
-        ...(connection.config.args ? { args: [...connection.config.args] } : {}),
-        ...(connection.config.env ? { env: { ...connection.config.env } } : {}),
-        ...(connection.config.url ? { url: connection.config.url } : {}),
-        ...(connection.config.headers ? { headers: { ...connection.config.headers } } : {}),
+    // 导出期望配置（含连接失败的），与持久化文件保持一致——dashboard JSON 编辑以此为准。
+    return Array.from(desiredConfigs.values()).map((config) => ({
+        name: config.name,
+        ...(config.description ? { description: config.description } : {}),
+        ...(config.transport ? { transport: config.transport } : {}),
+        ...(config.command ? { command: config.command } : {}),
+        ...(config.args ? { args: [...config.args] } : {}),
+        ...(config.env ? { env: { ...config.env } } : {}),
+        ...(config.url ? { url: config.url } : {}),
+        ...(config.headers ? { headers: { ...config.headers } } : {}),
     }));
 }
 
 export async function replaceConnectionConfigs(configs: McpServerConfig[]): Promise<void> {
-    await disconnectAll();
+    // 期望配置先落盘（意图优先）：单个 server 连接失败不能连累其他配置被删。
+    desiredConfigs.clear();
     for (const config of configs) {
-        await connectServer(config);
+        if (!config?.name?.trim()) continue;
+        desiredConfigs.set(config.name, config);
+    }
+    saveConnectionConfigs();
+
+    // 关闭不再包含在期望配置里的活连接（仍保留的会在下面按新配置重连）。
+    for (const name of Array.from(connections.keys())) {
+        if (!desiredConfigs.has(name)) await closeLiveConnection(name);
+    }
+
+    // 逐个连接：单个失败只记日志，不抛错、不影响其他 server。
+    for (const config of desiredConfigs.values()) {
+        try {
+            await connectServer(config);
+        } catch (err) {
+            process.stderr.write(`[mcp-bridge] ❌ 连接 "${config.name}" 失败: ${err}\n`);
+        }
     }
 }
 
 export async function autoReconnect(): Promise<void> {
     const configs = loadPersistedConnections();
     for (const config of configs) {
+        if (!config?.name?.trim()) continue; // 损坏条目（无 name）跳过
+        // 先把文件里的配置登记为期望配置：重连失败时它仍是期望配置，不会被后续落盘清掉。
+        desiredConfigs.set(config.name, config);
         try {
             await connectServer(config);
             process.stderr.write(`[mcp-bridge] ✅ 重连 "${config.name}" 成功\n`);
         } catch (err) {
+            // 只记日志：失败的配置保留在期望配置中，下次启动继续重试，绝不从持久化文件里删除。
             process.stderr.write(`[mcp-bridge] ❌ 重连 "${config.name}" 失败: ${err}\n`);
         }
     }
