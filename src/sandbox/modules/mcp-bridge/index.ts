@@ -77,6 +77,8 @@ interface McpConnection {
     outputBuffer?: string;
     /** Streamable HTTP 会话 ID */
     sessionId?: string;
+    /** 在途的会话重建。并发请求共享同一个恢复过程，避免互相作废对方刚拿到的新会话 */
+    sessionRecovery?: Promise<void>;
     /** SSE 最后一个 event id（用于后续可恢复扩展） */
     lastEventId?: string;
 }
@@ -345,12 +347,27 @@ function buildHttpHeaders(
 async function buildHttpError(response: Response): Promise<Error> {
     let details = "";
     try {
-        const text = await response.text();
-        details = text.trim();
+        details = (await response.text()).trim();
     } catch {
         details = "";
     }
+    return buildHttpErrorFromBody(response, details);
+}
+
+/** 与 buildHttpError 相同，但复用已读取的 body 文本（Response body 只能读一次）。 */
+function buildHttpErrorFromBody(response: Response, body: string): Error {
+    const details = body.trim();
     return new Error(`HTTP ${response.status} ${response.statusText}${details ? `: ${details}` : ""}`);
+}
+
+/**
+ * 判断 401 响应体属于「会话失效」还是「鉴权失败」。
+ * 部分网关（如 ModelScope 推理端点）会话过期返回 401 + {"Code":"SessionExpired"} 而不是 404 ——
+ * 这种情况重新 initialize 拿新会话即可恢复；token 错误的 401 响应体里不含 session 字样，
+ * 换会话没用，必须原样抛给调用方，否则会变成无意义的重试循环。
+ */
+function isSessionExpiredBody(body: string): boolean {
+    return /session/i.test(body) && /expired|invalid|not\s+found|unknown|missing/i.test(body);
 }
 
 function extractJsonRpcResult(payload: unknown, expectedId: number): { found: boolean; value?: unknown } {
@@ -514,9 +531,22 @@ async function sendJsonRpcHttpRequest(
         { skipSessionId: options?.skipSessionId }
     );
 
-    if (response.status === 404 && conn.sessionId && options?.skipSessionId !== true && options?.retryOnSessionReset !== false) {
-        conn.sessionId = undefined;
-        await initializeHttpConnection(conn);
+    if (response.status === 404 && options?.skipSessionId !== true && options?.retryOnSessionReset !== false) {
+        await recoverHttpSession(conn);
+        return sendJsonRpcHttpRequest(conn, method, params, { retryOnSessionReset: false });
+    }
+
+    // 会话过期也可能以 401 的形式出现（见 isSessionExpiredBody），处理方式与 404 相同
+    if (
+        response.status === 401 &&
+        options?.skipSessionId !== true &&
+        options?.retryOnSessionReset !== false
+    ) {
+        const body = await response.text().catch(() => "");
+        if (!isSessionExpiredBody(body)) {
+            throw buildHttpErrorFromBody(response, body);
+        }
+        await recoverHttpSession(conn);
         return sendJsonRpcHttpRequest(conn, method, params, { retryOnSessionReset: false });
     }
 
@@ -543,9 +573,23 @@ async function sendJsonRpcHttpNotification(
         { skipSessionId: options?.skipSessionId }
     );
 
-    if (response.status === 404 && conn.sessionId && options?.skipSessionId !== true && options?.retryOnSessionReset !== false) {
-        conn.sessionId = undefined;
-        await initializeHttpConnection(conn);
+    if (response.status === 404 && options?.skipSessionId !== true && options?.retryOnSessionReset !== false) {
+        await recoverHttpSession(conn);
+        await sendJsonRpcHttpNotification(conn, method, params, { retryOnSessionReset: false });
+        return;
+    }
+
+    // 与请求路径同理：会话过期也可能是 401（见 isSessionExpiredBody）
+    if (
+        response.status === 401 &&
+        options?.skipSessionId !== true &&
+        options?.retryOnSessionReset !== false
+    ) {
+        const body = await response.text().catch(() => "");
+        if (!isSessionExpiredBody(body)) {
+            throw buildHttpErrorFromBody(response, body);
+        }
+        await recoverHttpSession(conn);
         await sendJsonRpcHttpNotification(conn, method, params, { retryOnSessionReset: false });
         return;
     }
@@ -557,6 +601,25 @@ async function sendJsonRpcHttpNotification(
     await response.text().catch(() => {});
 }
 
+/**
+ * 重建会话：清掉旧 sessionId 并重新 initialize。
+ *
+ * 并发场景下多个请求可能同时撞上会话过期 —— 若各自独立 re-initialize，
+ * 服务端通常只保留最新会话，后完成的一方会把先完成一方刚拿到的新会话作废，
+ * 导致那次重试再次 401。因此共享同一个在途恢复，让并发请求一起等同一个新会话。
+ */
+function recoverHttpSession(conn: McpConnection): Promise<void> {
+    if (!conn.sessionRecovery) {
+        conn.sessionRecovery = (async () => {
+            conn.sessionId = undefined;
+            await initializeHttpConnection(conn);
+        })().finally(() => {
+            conn.sessionRecovery = undefined;
+        });
+    }
+    return conn.sessionRecovery;
+}
+
 async function initializeHttpConnection(conn: McpConnection): Promise<void> {
     conn.sessionId = undefined;
     const initializeResult = await sendJsonRpcHttpRequest(conn, "initialize", initializeParams(), {
@@ -566,7 +629,11 @@ async function initializeHttpConnection(conn: McpConnection): Promise<void> {
     if (!initializeResult || typeof initializeResult !== "object") {
         throw new Error(`MCP Server "${conn.config.name}" initialize 返回了无效结果`);
     }
-    await sendJsonRpcHttpNotification(conn, "notifications/initialized");
+    // retryOnSessionReset: false —— 重初始化过程中若再遇到会话失效必须直接失败，
+    // 否则「initialize → 通知 401 → 再 initialize」会形成无界循环。
+    await sendJsonRpcHttpNotification(conn, "notifications/initialized", undefined, {
+        retryOnSessionReset: false,
+    });
 }
 
 async function closeHttpConnection(conn: McpConnection): Promise<void> {

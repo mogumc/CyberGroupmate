@@ -311,6 +311,348 @@ describe("mcp-bridge Streamable HTTP", () => {
         }
     });
 
+    // ModelScope 推理端点的会话过期返回 401 + {"Code":"SessionExpired"} 而不是 404，
+    // 桥接层必须重新 initialize 拿新会话并重试，否则工具调用会一直 401 直到进程重启。
+    it("re-initializes the session and retries when the server expires it with HTTP 401", async () => {
+        initMcpBridge({ persistPath: "" });
+
+        let serverUrl = "";
+        let initializeCount = 0;
+        const toolCallSessionHeaders: string[] = [];
+
+        const server = createServer(async (req, res) => {
+            if (req.method !== "POST") {
+                res.writeHead(405);
+                res.end();
+                return;
+            }
+
+            const body = await readBody(req);
+            const msg = JSON.parse(body) as {
+                id?: number;
+                method?: string;
+            };
+
+            if (msg.method === "initialize") {
+                initializeCount += 1;
+                writeJson(
+                    res,
+                    {
+                        jsonrpc: "2.0",
+                        id: msg.id,
+                        result: {
+                            protocolVersion: "2025-03-26",
+                            capabilities: { tools: {} },
+                            serverInfo: { name: "mock-mcp", version: "1.0.0" },
+                        },
+                    },
+                    { "Mcp-Session-Id": `sess-${initializeCount}` },
+                );
+                return;
+            }
+
+            if (msg.method === "notifications/initialized") {
+                res.writeHead(202);
+                res.end();
+                return;
+            }
+
+            if (msg.method === "tools/list") {
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: {
+                        tools: [
+                            {
+                                name: "echo",
+                                description: "echo",
+                                inputSchema: {
+                                    type: "object",
+                                    properties: { value: { type: "string" } },
+                                },
+                            },
+                        ],
+                    },
+                });
+                return;
+            }
+
+            if (msg.method === "tools/call") {
+                const sessionId = String(req.headers["mcp-session-id"] ?? "");
+                toolCallSessionHeaders.push(sessionId);
+
+                // 第一代会话已过期：返回 ModelScope 风格的 401（注意不是 404）
+                if (sessionId === "sess-1") {
+                    res.writeHead(401, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        RequestId: "req-1",
+                        Code: "SessionExpired",
+                        Message: "session ec9add73dab140a19cc1ac40c471eb2f is expired",
+                    }));
+                    return;
+                }
+
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: { content: [{ type: "text", text: "ok-after-reinit" }] },
+                });
+                return;
+            }
+
+            res.writeHead(404);
+            res.end();
+        });
+
+        await new Promise<void>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+                const address = server.address();
+                if (!address || typeof address === "string") {
+                    throw new Error("Failed to bind mock MCP server");
+                }
+                serverUrl = `http://127.0.0.1:${address.port}/mcp`;
+                resolve();
+            });
+        });
+
+        try {
+            await mcpBridge.connect({
+                name: "demo-http",
+                description: "演示用 HTTP MCP 服务",
+                transport: "streamable-http",
+                url: serverUrl,
+            });
+
+            const result = await mcpBridge.call("demo-http", "echo", { value: "x" });
+            assert.equal(result, "ok-after-reinit");
+
+            assert.equal(initializeCount, 2, "应重新 initialize 拿新会话");
+            assert.deepEqual(
+                toolCallSessionHeaders,
+                ["sess-1", "sess-2"],
+                "重试请求必须携带重新 initialize 得到的新会话 ID",
+            );
+        } finally {
+            await disconnectAll();
+            await new Promise<void>((resolve, reject) => {
+                server.close((err) => (err ? reject(err) : resolve()));
+            });
+        }
+    });
+
+    // 反向边界：401 若是鉴权失败（token 错）而非会话失效，绝不能靠重新 initialize 硬扛，
+    // 否则会变成无意义的重试循环，还把真正的鉴权错误吞掉。
+    it("does not re-initialize on a non-session 401 (auth failure must surface)", async () => {
+        initMcpBridge({ persistPath: "" });
+
+        let serverUrl = "";
+        let initializeCount = 0;
+
+        const server = createServer(async (req, res) => {
+            if (req.method !== "POST") {
+                res.writeHead(405);
+                res.end();
+                return;
+            }
+
+            const body = await readBody(req);
+            const msg = JSON.parse(body) as { id?: number; method?: string };
+
+            if (msg.method === "initialize") {
+                initializeCount += 1;
+                writeJson(
+                    res,
+                    {
+                        jsonrpc: "2.0",
+                        id: msg.id,
+                        result: {
+                            protocolVersion: "2025-03-26",
+                            capabilities: { tools: {} },
+                            serverInfo: { name: "mock-mcp", version: "1.0.0" },
+                        },
+                    },
+                    { "Mcp-Session-Id": "sess-fixed" },
+                );
+                return;
+            }
+
+            if (msg.method === "notifications/initialized") {
+                res.writeHead(202);
+                res.end();
+                return;
+            }
+
+            if (msg.method === "tools/list") {
+                writeJson(res, { jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
+                return;
+            }
+
+            if (msg.method === "tools/call") {
+                res.writeHead(401, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ Code: "InvalidApiKey", Message: "invalid api key" }));
+                return;
+            }
+
+            res.writeHead(404);
+            res.end();
+        });
+
+        await new Promise<void>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+                const address = server.address();
+                if (!address || typeof address === "string") {
+                    throw new Error("Failed to bind mock MCP server");
+                }
+                serverUrl = `http://127.0.0.1:${address.port}/mcp`;
+                resolve();
+            });
+        });
+
+        try {
+            await mcpBridge.connect({
+                name: "bad-token",
+                description: "token 错误的服务",
+                transport: "streamable-http",
+                url: serverUrl,
+            });
+
+            await assert.rejects(
+                () => mcpBridge.call("bad-token", "echo", {}),
+                /InvalidApiKey|invalid api key/i,
+            );
+            assert.equal(initializeCount, 1, "鉴权失败不应触发重新 initialize");
+        } finally {
+            await disconnectAll();
+            await new Promise<void>((resolve, reject) => {
+                server.close((err) => (err ? reject(err) : resolve()));
+            });
+        }
+    });
+
+    // 并发场景：多个工具调用同时撞上会话过期时，必须共享同一个重建过程。
+    // mock 只认「最新一次 initialize」发下的会话（服务端常见行为）——
+    // 若各请求独立重初始化，后完成的一方会把先完成一方刚拿到的新会话作废，导致那次重试再次 401。
+    it("shares one session recovery across concurrent tool calls", async () => {
+        initMcpBridge({ persistPath: "" });
+
+        let serverUrl = "";
+        let initializeCount = 0;
+        // 连接时拿到的会话已被服务端过期（闲置超时的典型表现）——之后再用它就必须 401
+        const expiredSessions = new Set<string>(["sess-1"]);
+
+        const server = createServer(async (req, res) => {
+            if (req.method !== "POST") {
+                res.writeHead(405);
+                res.end();
+                return;
+            }
+
+            const body = await readBody(req);
+            const msg = JSON.parse(body) as { id?: number; method?: string };
+
+            if (msg.method === "initialize") {
+                initializeCount += 1;
+                writeJson(
+                    res,
+                    {
+                        jsonrpc: "2.0",
+                        id: msg.id,
+                        result: {
+                            protocolVersion: "2025-03-26",
+                            capabilities: { tools: {} },
+                            serverInfo: { name: "mock-mcp", version: "1.0.0" },
+                        },
+                    },
+                    { "Mcp-Session-Id": `sess-${initializeCount}` },
+                );
+                return;
+            }
+
+            if (msg.method === "notifications/initialized") {
+                res.writeHead(202);
+                res.end();
+                return;
+            }
+
+            if (msg.method === "tools/list") {
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: {
+                        tools: [
+                            {
+                                name: "echo",
+                                description: "echo",
+                                inputSchema: {
+                                    type: "object",
+                                    properties: { value: { type: "string" } },
+                                },
+                            },
+                        ],
+                    },
+                });
+                return;
+            }
+
+            if (msg.method === "tools/call") {
+                const sessionId = String(req.headers["mcp-session-id"] ?? "");
+                if (expiredSessions.has(sessionId)) {
+                    res.writeHead(401, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        Code: "SessionExpired",
+                        Message: `session ${sessionId.replace(/^sess-/, "")} is expired`,
+                    }));
+                    return;
+                }
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: { content: [{ type: "text", text: "ok" }] },
+                });
+                return;
+            }
+
+            res.writeHead(404);
+            res.end();
+        });
+
+        await new Promise<void>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+                const address = server.address();
+                if (!address || typeof address === "string") {
+                    throw new Error("Failed to bind mock MCP server");
+                }
+                serverUrl = `http://127.0.0.1:${address.port}/mcp`;
+                resolve();
+            });
+        });
+
+        try {
+            await mcpBridge.connect({
+                name: "demo-concurrent",
+                description: "并发会话过期演示",
+                transport: "streamable-http",
+                url: serverUrl,
+            });
+
+            const results = await Promise.all([
+                mcpBridge.call("demo-concurrent", "echo", { value: "a" }),
+                mcpBridge.call("demo-concurrent", "echo", { value: "b" }),
+                mcpBridge.call("demo-concurrent", "echo", { value: "c" }),
+            ]);
+            assert.deepEqual(results, ["ok", "ok", "ok"], "并发调用应全部成功");
+
+            // 恢复必须有界：初始 1 次 + 至多若干次重建，绝不能无界循环
+            assert.ok(initializeCount >= 2, "至少应触发一次会话重建");
+            assert.ok(initializeCount <= 4, `重建次数应有界，实际 ${initializeCount} 次`);
+        } finally {
+            await disconnectAll();
+            await new Promise<void>((resolve, reject) => {
+                server.close((err) => (err ? reject(err) : resolve()));
+            });
+        }
+    });
+
     it("exports and replaces global MCP configs", async () => {
         initMcpBridge({ persistPath: "" });
 
