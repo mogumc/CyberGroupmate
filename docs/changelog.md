@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-09-12: 清理两处历史迁移遗留的失败测试，测试套件转为全绿
+
+`pnpm test` 长期有 9 个稳定失败 + 1 个偶发失败。逐项定性后确认**全部是测试过时，无生产代码缺陷** ——
+两处架构迁移（隐身状态迁到跨平台 `userGate`、禁用词词表迁到 config）都没有同步测试，
+且都没记录 changelog，于是长期挂红无人认领。本次修正测试使其对齐现状，套件回到 **925/925 全绿**。
+
+### ✨ 核心改动
+
+- **禁用词测试**（`banned-words.test.ts`，4 个失败）：原用例把 `DEFAULT_BANNED_WORDS` 当词表传入，
+  而该默认值已被有意清空成 `[]`（词表改由 `config.subagent.banned_words` 管理）→ 空表必然返回空。
+  改为显式传入与 config 一致的词表；**并补一条「默认词表为空」的契约断言** —— 此前
+  「未配置则不拦截」这条行为完全没有覆盖。
+- **隐身测试**（`telegram-adapter.test.ts`，5 个失败）：断言用的是已删除的 `adapter.isUserInvisible()`。
+  隐身状态现由跨平台单例 `userGate` 持有，断言改为 `userGate.isInvisible()`。
+- **修掉测试对真实数据的破坏性副作用**：原用例靠 `fs.rmSync("workspace/invisible-users.json")` "重置"
+  状态 —— 既无效（单例只在模块加载时读一次文件，删文件不影响内存）又会清掉开发机真实的隐身名单。
+  改为显式重置单例，并在文件顶部快照、`after` 还原。
+- **消除 metrics 用例的偶发失败**（`#21`）：原用例硬编码端口 19200 起 HTTP server，端口占用即失败。
+  `MetricsExporter` 新增 `boundPort` getter，用例改用 `port: 0` 由系统分配端口。
+  顺带修正 `start()` 的日志 —— 配置 `port: 0` 时它原本会打印 `:0` 这种无意义的地址。
+
+### 改动文件清单
+
+| 文件 | 变更目的 |
+|---|---|
+| `tests/banned-words.test.ts` | 显式传词表；新增默认词表为空的契约断言 |
+| `tests/telegram-adapter.test.ts` | 断言改用 `userGate`；新增 `resetInvisible()` 与快照还原，去掉破坏性的删文件重置 |
+| `src/metrics/exporter.ts` | 新增 `boundPort` getter（`port: 0` 时读真实端口）；`start()` 日志改用真实端口 |
+| `tests/metrics-deployment-verification.test.ts` | `#21` 改用 `port: 0` + `boundPort`，消除固定端口的偶发失败 |
+
+---
+
 ## 2026-09-12: Grounding 接入 Tavily 并支持多 Key 轮询
 
 Grounding（联网事实查证）新增 `tavily` provider，并把原先「一个 provider 一个 api_key」的单薄配置升级为可配置的多 Key 轮询池，复用 `llm_profiles` 已有的 `LLMPool` 调度器，解决单一 Key 撞限额后整条查证链路直接哑火的问题。
@@ -43,6 +75,20 @@ Grounding（联网事实查证）新增 `tavily` provider，并把原先「一�
   另给 `buildTavilyDigest` 一个刻意收窄的 `TavilyDigestSource`（便于构造测试数据，SDK 响应可直接赋值）。
 - **资料块长度封顶**：advanced + chunks 3 后单次最多 5×3×500 字符，新增 `TAVILY_DIGEST_MAX_CHARS = 6000`
   截断并标注提示，避免降级路径把原始资料直接灌进执行器 prompt 时撑爆上下文。
+
+### 🔍 三次评审修正（同日）
+
+- **轮询状态改用联合类型**：`attemptGroundingOnce()` 原以 `{done, retryable}` 两个布尔位表达结果，
+  存在「既已完成又标记可重试」这种不可表达的组合。改为 `AttemptOutcome` 判别联合
+  （`result` / `retry` / `fail`），与同一文件里 `SummarizeOutcome` 的写法统一。
+- **不再吞掉「新消息到达」的中断信号**：`callLLMWithFallback()` 特意把中断重新抛出供上层处理，
+  而总结环节的 catch-all 会把它一并吃掉 —— 既打出一条误导性的「总结失败」warn，又白等一次注定
+  要被丢弃的降级。现在中断直接透传（`runParallelGrounding` 仍保证不抛异常给 dispatch）。
+- **给总结环节加超时约束**：总结调用位于 dispatch 的串行 await 路径上，此前只有 `callLLM` 的默认
+  60000ms 兜底 —— 叠加 Tavily 自身的 60s 请求超时，最坏情况会给一次派发增加约 120s。
+  `config.yaml` 显式配 `llm_routing.timeouts.grounding: 15000`，并在 `config.example.yaml` 补上
+  该字段的文档（此前 `RoutingComponentKey` 支持 `timeouts` 但示例里完全没提）。
+  超时后降级为原始检索资料，失败路径本身是安全的。
 
 ### 🔍 评审后修正（同日）
 

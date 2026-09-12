@@ -362,13 +362,14 @@ describe("Metrics Deployment Verification", () => {
     describe("Prometheus Format Compliance", () => {
         it("#21 metric names follow naming convention (lowercase, underscores)", async () => {
             const { MetricsExporter } = await import("../src/metrics/exporter.js");
-            const port = 19200;
+            // port 0 = 由系统分配空闲端口，避免固定端口（原为 19200）在并发/残留占用下偶发失败
             const exp = new MetricsExporter(
                 { collect() {} } as any,
                 { collect() {} } as any,
-                { host: "127.0.0.1", port, path: "/metrics" },
+                { host: "127.0.0.1", port: 0, path: "/metrics" },
             );
             await exp.start();
+            const port = exp.boundPort;
 
             try {
                 const res = await httpGet(`http://127.0.0.1:${port}/metrics`);

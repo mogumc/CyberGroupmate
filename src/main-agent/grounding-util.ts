@@ -25,7 +25,13 @@ import {
 import { getOrCreatePool } from "../core/llm-pool.js";
 import type { LLMPool } from "../core/llm-pool.js";
 import { createLogger } from "../core/logger.js";
-import { llmEvents, isQuotaError, isAuthError, callLLMWithFallback } from "../core/llm.js";
+import {
+    llmEvents,
+    isQuotaError,
+    isAuthError,
+    isLLMInterruptedByPendingMessage,
+    callLLMWithFallback,
+} from "../core/llm.js";
 import type { LLMCallEvent, LLMResponseEvent } from "../core/llm.js";
 
 const log = createLogger("grounding");
@@ -443,6 +449,9 @@ async function summarizeTavilyDigest(conversation: string, searchDigest: string)
         if (isNothingToVerify(text)) return { kind: "nothing" };
         return { kind: "ok", text };
     } catch (err) {
+        // 「新消息到达」导致的中断是控制流信号，不是失败 —— callLLMWithFallback 特意把它重新抛出，
+        // 这里若一并吞掉会打出一条误导性的「总结失败」warn，并白等一次注定要丢弃的降级。
+        if (isLLMInterruptedByPendingMessage(err)) throw err;
         log.warn("Tavily 检索结果总结失败，退回原始资料", { error: String(err).slice(0, 200) });
         return { kind: "unavailable" };
     }
@@ -581,40 +590,42 @@ function dispatchGrounding(
     }
 }
 
-/** 一次尝试的结果。done = 轮询应当终止（拿到业务结果，或没有可换的 key 了） */
-interface GroundingAttempt {
-    done: boolean;
-    /** done 时作为最终查证结果，undefined 表示被 Guardrail 丢弃 */
-    text?: string;
-    error?: unknown;
-    /** 是否值得换一个 key 重试（仅 quota/认证类失败） */
-    retryable: boolean;
-}
+/**
+ * 一次尝试的结果。三种状态互斥 —— 用联合类型而不是两个布尔位，
+ * 从数据模型上排除「既已完成又标记可重试」这类不可表达的组合。
+ */
+type AttemptOutcome =
+    /** 拿到业务结果（text 为 undefined 表示被 Guardrail 丢弃） */
+    | { kind: "result"; text?: string }
+    /** 该换一个 key 重试（仅 quota / 认证类失败） */
+    | { kind: "retry"; error: unknown }
+    /** 不该换 key 的失败，终止轮询 */
+    | { kind: "fail"; error: unknown };
 
 /**
  * 用池里下一个可用 key 尝试一次，内部完成 acquire → 调用 → release。
  * 把「是否该换 key」的判定收敛成返回值，避免调用方堆出多层嵌套 try/catch。
  *
- * 注意：Guardrail 丢弃（没有联网证据）是正常业务结果，必须 done + retryable=false，
+ * 注意：Guardrail 丢弃（没有联网证据）属于正常业务结果，必须返回 kind="result"，
  * 否则会拿着一个完全健康的 key 去白白轮询下一个。
  */
 async function attemptGroundingOnce(
     pool: LLMPool,
     config: GroundingConfig,
     input: GroundingInput,
-): Promise<GroundingAttempt> {
+): Promise<AttemptOutcome> {
     const handle = pool.acquire();
-    if (!handle) return { done: true, retryable: false }; // 所有 key 都在冷却中或已禁用
+    if (!handle) return { kind: "result" }; // 所有 key 都在冷却中或已禁用
 
     try {
         const text = await dispatchGrounding(config, handle.apiKey, input);
         pool.release(handle, true);
-        return { done: true, retryable: false, text };
+        return { kind: "result", text };
     } catch (err) {
         const quota = isQuotaError(err);
         const auth = isAuthError(err);
         pool.release(handle, false, quota, auth);
-        return { done: false, error: err, retryable: quota || auth };
+        return quota || auth ? { kind: "retry", error: err } : { kind: "fail", error: err };
     }
 }
 
@@ -631,10 +642,10 @@ async function runWithKeyRotation(
 
     for (let attempt = 0; attempt < pool.size; attempt++) {
         const outcome = await attemptGroundingOnce(pool, config, input);
-        if (outcome.done) return outcome.text;
+        if (outcome.kind === "result") return outcome.text;
 
         lastError = outcome.error;
-        if (!outcome.retryable || attempt === pool.size - 1) break;
+        if (outcome.kind === "fail" || attempt === pool.size - 1) break;
 
         log.warn("Grounding key 失效，切换下一个 key", {
             provider: config.provider,

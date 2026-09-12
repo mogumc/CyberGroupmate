@@ -133,6 +133,12 @@ llm_routing:
   # Tavily 是纯检索 API，自身没有 LLM 综合能力，需借宿主模型把资料整理成结论式查证；
   # 建议用便宜的小模型（这一步只是抽取与比对，不需要强模型）。不配置则退回第一个 profile。
   # grounding: gemini-flash
+  #
+  # 组件级请求超时（毫秒），未设置的组件用默认 60000。
+  # 注意：grounding 在 dispatch 关键路径上是串行 await 的，卡住会直接拖慢任务派发，
+  # 建议显式给一个较短的值（总结失败会退回原始检索资料，降级是安全的）。
+  # timeouts:
+  #   grounding: 15000
 
 # ─── Vision 看图设置 ───
 # 控制图片和贴纸的处理行为。需要配合 llm_routing.vision 或 llm_profiles 中设置 vision: true 使用。

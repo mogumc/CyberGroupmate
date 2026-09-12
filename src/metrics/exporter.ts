@@ -90,13 +90,23 @@ export class MetricsExporter {
         }
     }
 
+    /**
+     * 实际监听的端口。
+     * 配置 port=0 时由系统分配端口，只有 start() 之后读这个才能拿到真实值。
+     */
+    get boundPort(): number {
+        const address = this.server.address();
+        return address && typeof address === "object" ? address.port : this.config.port;
+    }
+
     /** 启动 HTTP server */
     start(): Promise<void> {
         return new Promise((resolve, reject) => {
             this.server.listen(this.config.port, this.config.host, () => {
+                const port = this.boundPort;
                 log.info(`Metrics exporter 已启动`, {
-                    url: `http://${this.config.host}:${this.config.port}${this.config.path}`,
-                    binding: `${this.config.host}:${this.config.port}`,
+                    url: `http://${this.config.host}:${port}${this.config.path}`,
+                    binding: `${this.config.host}:${port}`,
                     note: this.config.host === "127.0.0.1"
                         ? "仅本机可访问（localhost-only）"
                         : `⚠️ 绑定到 ${this.config.host}，请确认网络安全策略`,

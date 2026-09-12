@@ -2,7 +2,7 @@
  * telegram-adapter.test.ts — TelegramAdapter 登录与 ingress 测试
  */
 
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -15,6 +15,23 @@ import type { NotificationEvent } from "../src/event/notification-center.js";
 import { TelegramAdapter } from "../src/adapter/telegram-adapter.js";
 import { userGate } from "../src/adapter/user-gate.js";
 import type { TelegramConfig } from "../src/core/config.js";
+
+/**
+ * 隐身状态已从 adapter 迁移到跨平台单例 userGate，adapter 上不再有查询方法。
+ *
+ * 单例状态在同一进程内跨用例共享，且构造时只读一次 workspace/invisible-users.json，
+ * 所以「删文件」并不能重置状态 —— 必须显式清空单例。用完把进程启动时的快照还原，
+ * 避免测试顺手清掉开发机真实的隐身名单。
+ */
+const invisibleSnapshot = userGate.getInvisible();
+
+function resetInvisible(): void {
+    userGate.setInvisible([]);
+}
+
+after(() => {
+    userGate.setInvisible(invisibleSnapshot);
+});
 
 function makeNC(): NotificationCenter {
     // logPath/enableWatch are deprecated no-ops; NC no longer persists to disk.
@@ -845,8 +862,8 @@ interface TelegramClient {
     // ─── /invisible tests ───
 
     it("/invisible should toggle user invisibility and send confirmation", async () => {
-        // 清理跨测试/跨运行持久化状态
-        userGate.setInvisible([]); // 清理跨测试/跨运行持久化状态（单例内存态 + 文件）
+        // 重置跨测试共享的隐身状态（单例，见文件顶部的 resetInvisible）
+        resetInvisible();
         const nc = makeNC();
         const sentTexts: Array<[unknown, unknown]> = [];
         let newMessageHandler: ((msg: unknown) => void | Promise<void>) | null = null;
@@ -1210,8 +1227,8 @@ interface TelegramClient {
     // ─── @username command targeting tests ───
 
     it("should process /invisible@SelfUsername when username matches", async () => {
-        // 清理跨测试持久化状态，避免被前序测试污染
-        userGate.setInvisible([]); // 清理跨测试/跨运行持久化状态（单例内存态 + 文件）
+        // 重置跨测试共享的隐身状态（单例，见文件顶部的 resetInvisible）
+        resetInvisible();
         const nc = makeNC();
         const sentTexts: Array<[unknown, unknown]> = [];
         let newMessageHandler: ((msg: unknown) => void | Promise<void>) | null = null;
@@ -1256,8 +1273,8 @@ interface TelegramClient {
     });
 
     it("should ignore /invisible@OtherBot when username does not match self", async () => {
-        // 清理跨测试持久化状态，避免被前序测试污染
-        userGate.setInvisible([]); // 清理跨测试/跨运行持久化状态（单例内存态 + 文件）
+        // 重置跨测试共享的隐身状态（单例，见文件顶部的 resetInvisible）
+        resetInvisible();
         const nc = makeNC();
         const events = captureEvents(nc);
         const sentTexts: Array<[unknown, unknown]> = [];
@@ -1308,8 +1325,8 @@ interface TelegramClient {
     });
 
     it("should still process bare /invisible when self has no username", async () => {
-        // 清理跨测试持久化状态，避免被前序测试污染
-        userGate.setInvisible([]); // 清理跨测试/跨运行持久化状态（单例内存态 + 文件）
+        // 重置跨测试共享的隐身状态（单例，见文件顶部的 resetInvisible）
+        resetInvisible();
         const nc = makeNC();
         const sentTexts: Array<[unknown, unknown]> = [];
         let newMessageHandler: ((msg: unknown) => void | Promise<void>) | null = null;
@@ -1354,8 +1371,8 @@ interface TelegramClient {
     });
 
     it("should still process /invisible@AnyUser when self has no username", async () => {
-        // 清理跨测试持久化状态，避免被前序测试污染
-        userGate.setInvisible([]); // 清理跨测试/跨运行持久化状态（单例内存态 + 文件）
+        // 重置跨测试共享的隐身状态（单例，见文件顶部的 resetInvisible）
+        resetInvisible();
         const nc = makeNC();
         const sentTexts: Array<[unknown, unknown]> = [];
         let newMessageHandler: ((msg: unknown) => void | Promise<void>) | null = null;
