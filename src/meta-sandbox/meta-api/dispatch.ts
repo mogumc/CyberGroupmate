@@ -1,4 +1,5 @@
 import type { GroundingConfig } from "../../core/config.js";
+import { resolveGroundingKeys } from "../../core/config.js";
 import { loadConfig } from "../../core/config.js";
 import { shortUuid } from "../../core/ids.js";
 import { runParallelGrounding } from "../../main-agent/grounding-util.js";
@@ -78,6 +79,13 @@ type SubagentLike = {
 
 type SubagentManagerReader = Pick<SubagentManager, "getOrCreate" | "getSessionFilePath">;
 
+/**
+ * Grounding 配置来源。
+ * 传 getter 而不是对象，是为了让 Dashboard 保存配置后的热重载能立刻生效
+ * （启动时捕获的对象引用在 saveConfig 清缓存后就是旧的了）。
+ */
+export type GroundingConfigSource = GroundingConfig | (() => GroundingConfig | undefined);
+
 export interface DispatchApiDeps {
     subagentManager: SubagentManagerReader;
     memory: MemoryStoreV2;
@@ -91,7 +99,7 @@ export interface DispatchApiDeps {
     >;
     accumulator: AttentionAccumulator;
     onTaskDispatched?: (task: CodeActReplyTask) => void | Promise<void>;
-    groundingConfig?: GroundingConfig;
+    groundingConfig?: GroundingConfigSource;
     groundingRunner?: (
         config: GroundingConfig,
         messagesText: string,
@@ -283,12 +291,15 @@ async function maybeRunGrounding(
     deps: DispatchApiDeps,
     contentDirection: string,
 ): Promise<string | undefined> {
-    if (!deps.groundingConfig?.apiKey) {
+    const config = typeof deps.groundingConfig === "function"
+        ? deps.groundingConfig()
+        : deps.groundingConfig;
+    if (!config || resolveGroundingKeys(config).length === 0) {
         return undefined;
     }
 
     const runner = deps.groundingRunner ?? runParallelGrounding;
-    return runner(deps.groundingConfig, contentDirection);
+    return runner(config, contentDirection);
 }
 
 async function buildDispatchContext(

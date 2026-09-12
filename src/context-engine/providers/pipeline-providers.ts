@@ -163,6 +163,56 @@ export const groundingProvider: SectionProvider<GroundingData> = {
     },
 };
 
+// ═══ Grounding Summarize Provider ═══
+
+export interface GroundingSummarizeData {
+    /** 隐私脱敏后的对话内容 */
+    conversation: string;
+    /** 检索结果整理成的资料块 */
+    searchDigest: string;
+}
+
+/**
+ * Tavily 是纯检索 API，自身没有 LLM 综合能力。
+ * 为了让三个 provider 的输出语义一致（都交付「结论式事实核对」而非「原始素材」），
+ * Tavily 的检索结果需要再过一次模型总结 —— 该 provider 负责渲染这一步的 prompt。
+ */
+export const groundingSummarizeProvider: SectionProvider<GroundingSummarizeData> = {
+    schema: {
+        name: "grounding.summarize",
+        label: "检索结果总结",
+        source: "grounding.tavily",
+        cache: "volatile",
+        history: "ephemeral",
+    },
+    resolve(ctx) {
+        const conversation = ctx.conversation as string | undefined;
+        const searchDigest = ctx.searchDigest as string | undefined;
+        if (!conversation || !searchDigest) return null;
+        return { conversation, searchDigest };
+    },
+    render(data) {
+        return [
+            "你是一个事实查证助手。下面是群聊内容和一组联网检索到的资料。",
+            "请比对两者，输出查证结论。",
+            "",
+            "要求：",
+            "1. 补充对话中未覆盖的信息，并指出与资料不符的事实性陈述",
+            "2. 只输出与对话相关的结论，不要复述对话内容，也不要罗列资料原文",
+            "3. 涉及具体事实时标注来源编号（如 [资料2]）",
+            '4. 如果资料与对话无关，或对话中没有可查证的事实性陈述，只回复四个字：无需查证',
+            "",
+            "## 对话内容",
+            "",
+            data.conversation,
+            "",
+            "## 检索资料",
+            "",
+            data.searchDigest,
+        ].join("\n");
+    },
+};
+
 // ═══ Callback Provider ═══
 
 export interface CallbackData {

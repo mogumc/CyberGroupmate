@@ -117,7 +117,7 @@ export interface EmbeddingConfig {
 }
 
 /** 组件路由中可配置超时的组件名 */
-export type RoutingComponentKey = 'meta' | 'session' | 'recording_cluster' | 'recording_triage' | 'post_task_followup' | 'reflection' | 'compact' | 'memory' | 'vision';
+export type RoutingComponentKey = 'meta' | 'session' | 'recording_cluster' | 'recording_triage' | 'post_task_followup' | 'reflection' | 'compact' | 'memory' | 'vision' | 'grounding';
 
 /** 组件级 LLM 路由 — 每个组件可指定一个或多个 profile（fallback chain） */
 export interface LLMRoutingConfig {
@@ -139,6 +139,8 @@ export interface LLMRoutingConfig {
     memory?: string | string[];
     /** Vision 描述（vision-processor，独立配置） */
     vision?: string | string[];
+    /** Grounding 检索结果总结（仅 provider=tavily 需要，建议用便宜的小模型） */
+    grounding?: string | string[];
     /** 每组件 LLM 请求超时（毫秒）。未设置的组件使用默认 60000 */
     /** @deprecated 兼容旧配置：recording 会被同时应用到 recording_cluster 和 recording_triage */
     recording?: string | string[];
@@ -574,14 +576,45 @@ export interface McpServerPreConfig {
 
 /** Grounding（联网事实查证）配置 */
 export interface GroundingConfig {
-    /** 搜索提供者：google (Gemini Google Search) 或 grok (xAI Web Search) */
-    provider: "google" | "grok";
-    /** API Key */
+    /**
+     * 搜索提供者：
+     * - google — Gemini 原生 Google Search Grounding
+     * - grok   — xAI Web Search（Responses API）
+     * - tavily — Tavily Search（纯检索，无 LLM 综合）
+     */
+    provider: "google" | "grok" | "tavily";
+    /** 单个 API Key。配置了 pool 时此字段仅作展示/兜底，实际 key 由 pool 调度 */
     apiKey: string;
-    /** 自定义 Base URL（Grok 默认 https://api.x.ai/v1，Google 无需设置） */
+    /**
+     * 多 Key 轮询池，与 llm_profiles 的 pool 同构。
+     * 配置后按 strategy 在多个 key 之间轮询；遇到 429/quota 会自动冷却该 key 并切换下一个。
+     */
+    pool?: PoolConfig;
+    /** 自定义 Base URL（Grok 默认 https://api.x.ai/v1，Tavily 默认 https://api.tavily.com，Google 无需设置） */
     baseUrl?: string;
-    /** 使用的模型（Grok 默认 grok-3-mini-fast，Google 默认 gemini-2.0-flash-lite） */
+    /** 使用的模型（Grok 默认 grok-3-mini-fast，Google 默认 gemini-2.0-flash-lite，Tavily 不适用） */
     model?: string;
+}
+
+/** Grounding 可用的 provider 白名单 */
+const GROUNDING_PROVIDERS = new Set(["google", "grok", "tavily"]);
+
+/**
+ * 返回 Grounding 实际生效的 key 池（过滤掉空 key）。
+ * pool 优先，没有 pool 时把单个 apiKey 包成单成员池，
+ * 两者都没有则返回 undefined —— 这是「要不要跑 Grounding」的唯一判断入口。
+ */
+export function resolveGroundingPool(config?: GroundingConfig | null): PoolConfig | undefined {
+    if (!config) return undefined;
+    const pool = config.pool;
+    const members = (pool?.members ?? []).filter(m => m.apiKey);
+    if (pool && members.length > 0) return { strategy: pool.strategy, members };
+    return config.apiKey ? { strategy: "round_robin", members: [{ apiKey: config.apiKey }] } : undefined;
+}
+
+/** 返回 Grounding 可用的 API Key 列表（resolveGroundingPool 的投影） */
+export function resolveGroundingKeys(config?: GroundingConfig | null): string[] {
+    return resolveGroundingPool(config)?.members.map(m => m.apiKey) ?? [];
 }
 
 /**
@@ -735,7 +768,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
     // 解析 per-component timeouts
     const rawTimeouts = (fileRouting.timeouts ?? {}) as Record<string, unknown>;
     const parsedTimeouts: LLMRoutingConfig['timeouts'] = {};
-    for (const key of ['meta', 'session', 'recording_cluster', 'recording_triage', 'post_task_followup', 'recording', 'reflection', 'compact', 'memory', 'vision'] as const) {
+    for (const key of ['meta', 'session', 'recording_cluster', 'recording_triage', 'post_task_followup', 'recording', 'reflection', 'compact', 'memory', 'vision', 'grounding'] as const) {
         if (rawTimeouts[key] != null) {
             parsedTimeouts[key] = num(rawTimeouts[key], 60000);
         }
@@ -753,6 +786,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         compact: parseRoutingValue(fileRouting.compact),
         memory: parseRoutingValue(fileRouting.memory),
         vision: parseRoutingValue(fileRouting.vision),
+        grounding: parseRoutingValue(fileRouting.grounding),
         timeouts: Object.keys(parsedTimeouts).length > 0 ? parsedTimeouts : undefined,
     };
 
@@ -1302,12 +1336,17 @@ function parsePrivacyConfig(fileConfig: Record<string, unknown>): PrivacyConfig 
 function parseGroundingConfig(fileConfig: Record<string, unknown>): GroundingConfig | undefined {
     const raw = fileConfig.grounding as Record<string, unknown> | undefined;
     if (!raw || typeof raw !== "object") return undefined;
-    const provider = str(raw.provider) as "google" | "grok" | undefined;
-    const apiKey = str(raw.api_key);
-    if (!provider || !apiKey) return undefined;
+    const rawProvider = str(raw.provider);
+    if (!rawProvider || !GROUNDING_PROVIDERS.has(rawProvider)) return undefined;
+    const pool = parsePoolConfig(raw.pool);
+    // 只配 pool 时 api_key 可以为空——不要在解析期用 pool 里的 key 回填，
+    // 否则序列化会把首个 key 同时写进 api_key，配置里出现两份会漂移的同一密钥。
+    const apiKey = str(raw.api_key) ?? "";
+    if (!apiKey && !pool) return undefined;
     return {
-        provider,
+        provider: rawProvider as GroundingConfig["provider"],
         apiKey,
+        pool,
         baseUrl: str(raw.base_url),
         model: str(raw.model),
     };
@@ -1381,6 +1420,36 @@ function parseEnvVars(fileConfig: Record<string, unknown>): EnvironmentVariable[
 
 // ─── 内部辅助 ───
 
+const VALID_POOL_STRATEGIES = new Set<string>(["round_robin", "least_pending", "random"]);
+
+/**
+ * 解析 `pool: { strategy, keys: [{ api_key, base_url, weight }] }` 配置。
+ * llm_profiles 与 grounding 共用（都不配就返回 undefined）。
+ */
+function parsePoolConfig(rawPool: unknown): PoolConfig | undefined {
+    if (!rawPool || typeof rawPool !== "object") return undefined;
+    const poolObj = rawPool as Record<string, unknown>;
+    const rawKeys = poolObj.keys as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(rawKeys) || rawKeys.length === 0) return undefined;
+
+    const members: PoolMemberConfig[] = rawKeys.map(k => ({
+        apiKey: str(k.api_key) ?? "",
+        baseUrl: str(k.base_url),
+        weight: k.weight != null ? num(k.weight, 1) : undefined,
+    })).filter(m => m.apiKey.length > 0);
+    if (members.length === 0) return undefined;
+
+    const rawStrategy = str(poolObj.strategy) ?? "round_robin";
+    let strategy: PoolStrategy = "round_robin";
+    if (VALID_POOL_STRATEGIES.has(rawStrategy)) {
+        strategy = rawStrategy as PoolStrategy;
+    } else {
+        console.warn(`[Config] pool.strategy "${rawStrategy}" 无效，使用 round_robin`);
+    }
+
+    return { strategy, members };
+}
+
 function parseLLMProfile(raw: Record<string, unknown>): LLMConfig {
     const rawPricing = raw.pricing as Record<string, unknown> | undefined;
     let pricing: LLMConfig["pricing"] = undefined;
@@ -1394,32 +1463,7 @@ function parseLLMProfile(raw: Record<string, unknown>): LLMConfig {
     }
 
     // 解析 pool 配置
-    let pool: PoolConfig | undefined = undefined;
-    const rawPool = raw.pool as Record<string, unknown> | undefined;
-    if (rawPool && typeof rawPool === "object") {
-        const rawKeys = rawPool.keys as Array<Record<string, unknown>> | undefined;
-        if (Array.isArray(rawKeys) && rawKeys.length > 0) {
-            const members: PoolMemberConfig[] = rawKeys.map(k => ({
-                apiKey: str(k.api_key) ?? "",
-                baseUrl: str(k.base_url),
-                weight: k.weight != null ? num(k.weight, 1) : undefined,
-            })).filter(m => m.apiKey.length > 0);
-            if (members.length > 0) {
-                const VALID_STRATEGIES = new Set(["round_robin", "least_pending", "random"]);
-                const rawStrategy = str(rawPool.strategy) ?? "round_robin";
-                const strategy = VALID_STRATEGIES.has(rawStrategy)
-                    ? rawStrategy as PoolStrategy
-                    : (() => {
-                        console.warn(`[Config] pool.strategy "${rawStrategy}" 无效，使用 round_robin`);
-                        return "round_robin" as PoolStrategy;
-                    })();
-                pool = {
-                    strategy,
-                    members,
-                };
-            }
-        }
-    }
+    const pool = parsePoolConfig(raw.pool);
 
     // 解析 vertex_credentials（JSON 对象，直接保存在 config.yaml 原文中）
     let vertexCredentials: Record<string, unknown> | undefined;
@@ -1540,6 +1584,19 @@ function parseOneBotHumanizedDelay(fileOB: Record<string, unknown>): OneBotConfi
 
 // ─── 序列化 + 验证（Dashboard Config Editor 用） ───
 
+/** 将 PoolConfig 序列化为 YAML 的 `pool: { strategy, keys: [...] }`（llm_profiles / grounding 共用） */
+function serializePoolConfig(pool: PoolConfig): Record<string, unknown> {
+    return {
+        strategy: pool.strategy,
+        keys: pool.members.map(m => {
+            const k: Record<string, unknown> = { api_key: m.apiKey };
+            if (m.baseUrl) k.base_url = m.baseUrl;
+            if (m.weight != null && m.weight !== 1) k.weight = m.weight;
+            return k;
+        }),
+    };
+}
+
 /** 将 AppConfig 序列化为 YAML 格式的对象（snake_case keys） */
 export function serializeConfigToObject(config: AppConfig): Record<string, unknown> {
     const obj: Record<string, unknown> = {};
@@ -1580,15 +1637,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             entry.pricing = pricing;
         }
         if (p.pool) {
-            entry.pool = {
-                strategy: p.pool.strategy,
-                keys: p.pool.members.map(m => {
-                    const k: Record<string, unknown> = { api_key: m.apiKey };
-                    if (m.baseUrl) k.base_url = m.baseUrl;
-                    if (m.weight != null && m.weight !== 1) k.weight = m.weight;
-                    return k;
-                }),
-            };
+            entry.pool = serializePoolConfig(p.pool);
         }
         profiles[name] = entry;
     }
@@ -1920,6 +1969,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             provider: config.grounding.provider,
             api_key: config.grounding.apiKey,
         };
+        if (config.grounding.pool) g.pool = serializePoolConfig(config.grounding.pool);
         if (config.grounding.baseUrl) g.base_url = config.grounding.baseUrl;
         if (config.grounding.model) g.model = config.grounding.model;
         obj.grounding = g;
@@ -2154,6 +2204,19 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
     if (emb) {
         if (emb.provider && emb.provider !== "openai" && emb.provider !== "local") {
             errors.push("embedding.provider 必须是 \"openai\" 或 \"local\"");
+        }
+    }
+
+    // grounding
+    const grounding = c.grounding as Record<string, unknown> | undefined;
+    if (grounding && typeof grounding === "object") {
+        const provider = grounding.provider;
+        if (provider && !GROUNDING_PROVIDERS.has(String(provider))) {
+            errors.push(`grounding.provider 必须是 ${[...GROUNDING_PROVIDERS].map(p => `"${p}"`).join(" / ")}`);
+        }
+        const gPool = grounding.pool as PoolConfig | undefined;
+        if (gPool && (!gPool.members || gPool.members.length === 0)) {
+            errors.push("grounding.pool.keys 不能为空");
         }
     }
 

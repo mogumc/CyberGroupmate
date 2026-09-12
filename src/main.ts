@@ -1230,7 +1230,8 @@ async function main(): Promise<void> {
         subagentManager,
         globalState,
         accumulator,
-        groundingConfig: appConfig.grounding,
+        // 传 getter 而非对象：Dashboard 保存 grounding 配置后无需重启即可生效
+        groundingConfig: () => loadConfig().grounding,
         getActiveUserProfilesForChat: (chatId) => activeUserProfilesForDispatch.get(chatId),
         getQuoteOutput: (index) => metaSandbox?.getOutput(index),
         getHarnessManager: () => harnessManager,

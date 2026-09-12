@@ -98,6 +98,7 @@
     { key: "compact", label: "上下文压缩", desc: "对话历史摘要" },
     { key: "memory", label: "记忆检索", desc: "Deep recall" },
     { key: "vision", label: "视觉描述", desc: "图片/贴纸描述" },
+    { key: "grounding", label: "查证总结", desc: "Tavily 检索结果总结" },
   ];
 
   $: if ($activeTab === "config" && !config) loadConfigData();

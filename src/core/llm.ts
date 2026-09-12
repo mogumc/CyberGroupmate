@@ -314,7 +314,7 @@ const RETRY_DELAYS = [1000, 2000, 4000]; // 指数退避
 /**
  * 检测错误是否为 quota/rate-limit 类型
  */
-function isQuotaError(err: unknown): boolean {
+export function isQuotaError(err: unknown): boolean {
     if (!(err instanceof Error)) return false;
     const msg = err.message;
     return msg.includes("429") || msg.includes("rate limit") ||
@@ -327,7 +327,7 @@ function isQuotaError(err: unknown): boolean {
 /**
  * 检测错误是否为认证/权限类型（key 无效、billing 被关）
  */
-function isAuthError(err: unknown): boolean {
+export function isAuthError(err: unknown): boolean {
     if (!(err instanceof Error)) return false;
     const msg = err.message;
     return msg.includes("401") || msg.includes("403") ||

@@ -1,5 +1,76 @@
 # Changelog
 
+## 2026-09-12: Grounding 接入 Tavily 并支持多 Key 轮询
+
+Grounding（联网事实查证）新增 `tavily` provider，并把原先「一个 provider 一个 api_key」的单薄配置升级为可配置的多 Key 轮询池，复用 `llm_profiles` 已有的 `LLMPool` 调度器，解决单一 Key 撞限额后整条查证链路直接哑火的问题。
+
+### ✨ 核心特性
+
+- **Tavily Provider**：新增 `provider: tavily`。Tavily 是纯检索 API（无 LLM 综合），因此不直接套用 `groundingProvider` 的 LLM 提示词模板，而是把脱敏后的对话尾部压成一条 query 检索；返回结果由 `answer` + Top5 结果拼装成查证上下文，`results` 为空时按 Guardrail 丢弃。
+- **多 Key 轮询池**：`grounding.pool` 与 `llm_profiles.pool` 同构（`strategy` + `keys[]`），支持 `round_robin` / `least_pending` / `random`。命中的 Key 若返回 429/quota 会指数退避冷却，401/403 直接永久禁用，**本次请求会自动换下一个 Key 重试**（最多尝试 pool.size 次）——不再需要人工重启。
+- **Tavily 非标准限额码归一化**：Tavily 用 432（套餐额度用尽）/433（按量付费上限）而非 429 表达超额，`rethrowTavilyError` 会把这套码补成可被 `isQuotaError` 识别的形式，保证换 Key 逻辑对 Tavily 同样生效。
+- **向后兼容**：未配置 `pool` 时自动把单个 `api_key` 包成单成员 pool，行为与旧版完全一致；旧配置零改动即可运行。
+- **配置解析复用**：把 `parsePoolConfig` / `serializePoolConfig` 从 `parseLLMProfile` 中抽出，`llm_profiles` 与 `grounding` 共用，避免两套 pool 解析逻辑漂移。
+- **Dashboard 配置界面**：Grounding 面板支持动态增删 Key（≥2 个自动切换为轮询模式）、按 provider 切换 Base URL 占位符与说明文案，并在启用多 Key 时提示失效 Key 的处理策略。
+- **配置热重载**：`groundingConfig` 由启动时捕获对象改为传 getter（`GroundingConfigSource`），这组密钥在 Dashboard 保存后立即生效，不必再重启进程。
+
+### 🔁 检索结果总结：Tavily 输出语义与 google/grok 对齐（同日）
+
+原实现里三个 provider 的**输出契约不一致**：google/grok 交付「结论式事实核对」，tavily 只交付「原始网页素材」，而下游执行器只有一种接收契约（`## 事实查证 / 以下是通过联网搜索获得的相关事实信息`）。本次把 Tavily 补齐。
+
+- **检索档位修正**：`search_depth` 由 `basic` 改为 `advanced` + `chunks_per_source: 3`。
+  basic 每个来源只返回**一段泛化摘要**（「这页在讲什么」），对「版本号/日期/数字」这类精确事实最容易漏；
+  advanced 返回**按 query 选取的多段相关切块**（每块 ≤500 字符）。代价是 2 credits/次（原 1 credit）。
+- **新增总结步骤**：检索结果整理成编号资料块后，交宿主 LLM 综合成结论式查证 —— 补齐「Tavily 自身没有 LLM」这个语义差。
+  新增 `llm_routing.grounding` 组件键（建议用便宜的小模型），复用既有的
+  `resolveComponentProfiles()` + `callLLMWithFallback()`（profile 链 fallback + 重试 + 限速全在内部，无需自研）。
+- **失败一律降级，不丢数据**：总结不可用（未配置 / 调用失败 / 返回空）时退回原始资料块 —— 已经花额度换来的检索结果不能因为总结环节被丢掉。
+- **Guardrail 补齐**：总结模型判定「无需查证」时丢弃结果，与 google/grok 的「无搜索证据则丢弃」语义对齐。
+  判定只看极短回复（≤12 字），避免正常结论里恰好提到该词被误杀。
+- **资料块结构化**：检索结果按 `【资料N】标题 / URL / 正文` 编号，让总结模型能标注来源（对标 google/grok 的「标注来源」要求）。
+
+### 🔍 二次评审修正（同日）
+
+- **🔴 `llm_routing.grounding` 被静默忽略（真 bug）**：`llm_routing` 的解析是**逐组件硬编码枚举**的
+  （`config.ts` 里一个显式对象字面量 + 一个 timeouts 白名单数组），上一轮只加了 `RoutingComponentKey`
+  类型、文档与 Dashboard 条目，漏了这两处运行时解析 —— 结果配了 `llm_routing.grounding` 完全不生效，
+  永远回退到第一个 profile 并刷 warn。已补上两处，并加回归测试钉死（含组件级 timeout 与序列化往返）。
+- **`isNothingToVerify` 判定收紧**：原实现用「长度 ≤12 且包含『无需查证』」，阈值是拍脑袋的，
+  且偏向「误丢弃真结论」。改为「规范化标点空白后以该标记**开头**」——
+  既能覆盖「无需查证。」「无需查证，资料与对话无关」，又不会误杀「……因此对话中无需查证的判断不成立」这类结论。
+- **去掉重复的 API 类型声明与多余断言**：`@tavily/core` 已导出 `TavilySearchResponse`，
+  原代码手搓了一个同名子集接口并配 `as` 断言，属重复声明 + 掩盖类型错误。改为直接用 SDK 类型，
+  另给 `buildTavilyDigest` 一个刻意收窄的 `TavilyDigestSource`（便于构造测试数据，SDK 响应可直接赋值）。
+- **资料块长度封顶**：advanced + chunks 3 后单次最多 5×3×500 字符，新增 `TAVILY_DIGEST_MAX_CHARS = 6000`
+  截断并标注提示，避免降级路径把原始资料直接灌进执行器 prompt 时撑爆上下文。
+
+### 🔍 评审后修正（同日）
+
+- **密钥不再存两份**：`parseGroundingConfig` 原本在只配 `pool` 时把首个成员回填进 `apiKey`，导致保存配置时 `api_key` 与 `pool.keys[0]` 各存一份、且会各自漂移。改为不回填，并同步修正 Dashboard 侧「走 pool 时清空 api_key」。
+- **单一数据来源**：新增 `resolveGroundingPool()` 作为「要不要跑 Grounding / 用哪些 key」的唯一判断入口，`resolveGroundingKeys()` 退化为它的投影；删掉 grounding-util 里那个对「空 pool」判断不一致的 `groundingKeyPool()`。
+- **压缩嵌套**：把 `runParallelGrounding` 里 4 层嵌套的 for/try/catch 拆成 `attemptGroundingOnce()`（负责 acquire→调用→release，并把「该不该换 key」收敛成返回值）+ `runWithKeyRotation()`（负责轮询），主函数回归到「脱敏 → 准备输入 → 交给轮询」的线性流程。同时用显式返回类型保住「Grounding 永不抛异常、不拖垮 dispatch」的原有约束。
+- **去掉多余类型断言**：两处 `as LLMResponseEvent` 属拷贝残留（既有事件辅助函数的参数已是强类型），删掉后 `tsc` 依旧干净。
+- **补轮询行为测试**：新增 `tests/grounding-rotation.test.ts`，用打桩 fetch 覆盖 429/401 换 key、全部失败降级、非配额错误不换 key、**Guardrail 丢弃不换 key**（健康 key 不该被白白轮掉）等分支。
+
+### 改动文件清单
+
+| 文件 | 变更目的 |
+|---|---|
+| `src/core/config.ts` | **[REFACTOR]** `GroundingConfig.provider` 增加 `tavily`、新增 `pool`；抽出 `parsePoolConfig`/`serializePoolConfig` 供 llm_profiles 与 grounding 共用；新增 `resolveGroundingPool()`（唯一来源）与 `resolveGroundingKeys()`；`RoutingComponentKey` 增加 `grounding`；`validateConfig` 增加 grounding provider 白名单与 pool 校验 |
+| `src/context-engine/providers/pipeline-providers.ts` | **[NEW]** 新增 `groundingSummarizeProvider`：渲染「对话 + 检索资料 → 查证结论」的总结 prompt（与 `groundingProvider` 并列） |
+| `src/main-agent/grounding-util.ts` | **[FEATURE]** 新增 Tavily provider、`buildTavilyQuery`/`buildTavilyDigest`/`isNothingToVerify`/`rethrowTavilyError`；Tavily 检索档位升级为 advanced + chunks 3；新增 `summarizeTavilyDigest()` 走 `callLLMWithFallback` 综合；`runParallelGrounding` 拆为 `attemptGroundingOnce` + `runWithKeyRotation` 并复用 `LLMPool` 做 Key 轮询；抽出 `emitGroundingCall`/`emitGroundingResponse` 消除三处事件发射样板 |
+| `src/core/llm.ts` | 导出 `isQuotaError` / `isAuthError`，供 Grounding 复用同一套错误分类 |
+| `src/meta-sandbox/meta-api/dispatch.ts` | Grounding 配置守卫由 `apiKey` 改为 `resolveGroundingKeys().length`；配置来源支持 getter（`GroundingConfigSource`）以支持热重载 |
+| `src/main.ts` | `groundingConfig` 改为 `() => loadConfig().grounding` |
+| `src/dashboard/ui/src/panels/config/GroundingTab.svelte` | **[NEW UI]** Tavily 选项、多 Key 增删与调度策略选择、provider 相关文案 |
+| `src/dashboard/ui/src/panels/ConfigPanel.svelte` | `ROUTING_COMPONENTS` 增加「查证总结」项 |
+| `config.yaml` / `config.example.yaml` | 补充 grounding pool 配置示例、Tavily 说明与 `llm_routing.grounding` 文档 |
+| `tests/grounding-config.test.ts` | **[NEW]** 覆盖 Key 优先级、pool-only 配置、序列化往返不丢 keys、query 截断边界、资料块编号、无需查证判定、432/433 配额码归一化 |
+| `tests/grounding-rotation.test.ts` | **[NEW]** 覆盖多 Key 轮询与 Guardrail 的分支行为 |
+| `tests/context-engine.test.ts` | 增加 `groundingSummarizeProvider` 渲染断言（钉住「无需查证」约定词，防止改 prompt 时静默失效） |
+
+---
+
 ## 2026-04-19: Sandbox \`shell\` 模块升级：支持 Multi-Tab 与长时任务后台运行
 
 将 Sandbox 的终端环境从单 PTY（伪终端）阻塞架构重构为支持 \`detach\` / \`attach\` 后台管理的 Multi-Tab 架构，显著提升了 Agent 运行耗时命令（如开发服务器、编译任务）且不阻塞主线程的能力。

@@ -9,7 +9,7 @@ import type { HarnessManager } from "../../harness/manager.js";
 import { createAgentsApi } from "./agents.js";
 import { createBackgroundApi } from "./background.js";
 import { createConversationsApi } from "./conversations.js";
-import { createDispatchApi, type DispatchApiDeps } from "./dispatch.js";
+import { createDispatchApi, type DispatchApiDeps, type GroundingConfigSource } from "./dispatch.js";
 import { createMemoryApi } from "./memory.js";
 import { createPrivacyApi } from "./privacy.js";
 import { createCronApi, createReminderApi } from "./scheduler.js";
@@ -37,7 +37,7 @@ export interface BuildMetaApiContextDeps extends Omit<DispatchApiDeps, "subagent
     subagentManager: SubagentManager;
     globalState: GlobalState;
     accumulator: AttentionAccumulator;
-    groundingConfig?: GroundingConfig;
+    groundingConfig?: GroundingConfigSource;
     getActiveUserProfilesForChat?: (chatId: string) => ActiveUserProfile[] | undefined;
     getHarnessManager?: () => HarnessManager | null;
 }

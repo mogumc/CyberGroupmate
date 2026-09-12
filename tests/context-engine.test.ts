@@ -23,6 +23,7 @@ import {
     topicClusteringProvider,
     topicTriageProvider,
     groundingProvider,
+    groundingSummarizeProvider,
 } from "../src/context-engine/providers/pipeline-providers.js";
 import {
     formatRelativeTime,
@@ -444,6 +445,19 @@ describe("Pipeline Providers", () => {
         assert.ok(rendered.includes("事实查证"));
         assert.ok(rendered.includes("GPT-5"));
         assert.ok(rendered.includes("搜索"));
+    });
+
+    // 「无需查证」这个约定词是 grounding-util 里 isNothingToVerify() 的判定依据，
+    // 改 prompt 时若把它删掉，那处判定会静默失效 —— 所以这里钉住。
+    it("groundingSummarizeProvider 渲染对话与资料，并保留「无需查证」约定", () => {
+        const rendered = groundingSummarizeProvider.render({
+            conversation: "User 1: 据说 GPT-5 上周发布了",
+            searchDigest: "【资料1】OpenAI 官网\nURL: https://example.com",
+        });
+
+        assert.ok(rendered.includes("无需查证"));
+        assert.ok(rendered.includes("GPT-5"));
+        assert.ok(rendered.includes("资料1"));
     });
 });
 

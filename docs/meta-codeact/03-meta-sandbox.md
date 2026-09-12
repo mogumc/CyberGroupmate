@@ -215,7 +215,7 @@ export function createDispatchApi(deps: {
 
       // 自动 Grounding（每次 dispatch 都触发）
       let groundingContext: string | undefined;
-      if (deps.groundingConfig?.apiKey) {
+      if (deps.groundingConfig && resolveGroundingKeys(deps.groundingConfig).length > 0) {
         try {
           // 用 contentDirection 作为 Grounding 输入
           groundingContext = await runParallelGrounding(
