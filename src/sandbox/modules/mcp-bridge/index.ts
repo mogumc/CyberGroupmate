@@ -370,6 +370,37 @@ function isSessionExpiredBody(body: string): boolean {
     return /session/i.test(body) && /expired|invalid|not\s+found|unknown|missing/i.test(body);
 }
 
+/**
+ * 会话丢失统一判定（请求与通知两条路径共用）。
+ *
+ * - 主判定是 404：MCP Streamable HTTP 规范明确服务端以 404 表示会话过期/终止，
+ *   厂商无关、确定性判定 —— 状态码 + 会话能力守卫即可，无需读响应体。
+ * - 401 是从属的非标准信号：401 状态码无法区分鉴权失败与会话过期，
+ *   必须 body 嗅探佐证（见 isSessionExpiredBody）；措辞不含会话失效含义的 401
+ *   是真鉴权失败，原样抛出，不能靠重开会话硬扛。
+ * - 守卫：仅当连接具备会话能力（已有会话，或有在途恢复）时才可能发生会话丢失。
+ *   无会话服务器的 404/401 与会话无关，恢复必然无效，直接交回上层报错；
+ *   `|| conn.sessionRecovery` 覆盖恢复窗口内的并发请求 —— 此时 sessionId 已被清空，
+ *   但应加入在途共享恢复而不是误判为不可恢复。
+ */
+async function shouldRecoverSession(
+    conn: McpConnection,
+    response: Response,
+    options?: { skipSessionId?: boolean; retryOnSessionReset?: boolean }
+): Promise<boolean> {
+    if (options?.skipSessionId === true || options?.retryOnSessionReset === false) return false;
+    if (!conn.sessionId && !conn.sessionRecovery) return false;
+    if (response.status === 404) return true;
+    if (response.status === 401) {
+        const body = await response.text().catch(() => "");
+        if (!isSessionExpiredBody(body)) {
+            throw buildHttpErrorFromBody(response, body);
+        }
+        return true;
+    }
+    return false;
+}
+
 function extractJsonRpcResult(payload: unknown, expectedId: number): { found: boolean; value?: unknown } {
     const messages = Array.isArray(payload) ? payload : [payload];
     for (const message of messages) {
@@ -531,21 +562,7 @@ async function sendJsonRpcHttpRequest(
         { skipSessionId: options?.skipSessionId }
     );
 
-    if (response.status === 404 && options?.skipSessionId !== true && options?.retryOnSessionReset !== false) {
-        await recoverHttpSession(conn);
-        return sendJsonRpcHttpRequest(conn, method, params, { retryOnSessionReset: false });
-    }
-
-    // 会话过期也可能以 401 的形式出现（见 isSessionExpiredBody），处理方式与 404 相同
-    if (
-        response.status === 401 &&
-        options?.skipSessionId !== true &&
-        options?.retryOnSessionReset !== false
-    ) {
-        const body = await response.text().catch(() => "");
-        if (!isSessionExpiredBody(body)) {
-            throw buildHttpErrorFromBody(response, body);
-        }
+    if (await shouldRecoverSession(conn, response, options)) {
         await recoverHttpSession(conn);
         return sendJsonRpcHttpRequest(conn, method, params, { retryOnSessionReset: false });
     }
@@ -573,22 +590,7 @@ async function sendJsonRpcHttpNotification(
         { skipSessionId: options?.skipSessionId }
     );
 
-    if (response.status === 404 && options?.skipSessionId !== true && options?.retryOnSessionReset !== false) {
-        await recoverHttpSession(conn);
-        await sendJsonRpcHttpNotification(conn, method, params, { retryOnSessionReset: false });
-        return;
-    }
-
-    // 与请求路径同理：会话过期也可能是 401（见 isSessionExpiredBody）
-    if (
-        response.status === 401 &&
-        options?.skipSessionId !== true &&
-        options?.retryOnSessionReset !== false
-    ) {
-        const body = await response.text().catch(() => "");
-        if (!isSessionExpiredBody(body)) {
-            throw buildHttpErrorFromBody(response, body);
-        }
+    if (await shouldRecoverSession(conn, response, options)) {
         await recoverHttpSession(conn);
         await sendJsonRpcHttpNotification(conn, method, params, { retryOnSessionReset: false });
         return;

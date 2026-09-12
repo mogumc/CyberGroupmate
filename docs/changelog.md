@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-09-12: MCP 桥接会话过期恢复：404/401 统一判定 + 共享并发重建
+
+部分网关（如 ModelScope 推理端点）会话过期返回 `401 + {"Code":"SessionExpired"}` 而不是 404，
+此前桥接层只处理 404 且各自独立重建 → 工具调用会持续 401 直到进程重启，并发请求还会互相作废
+对方刚拿到的新会话。本次落地三轮评审决策（会话能力守卫、404/401 整合、主判定方式），
+`pnpm test` **949/949 全绿**。
+
+### ✨ 核心改动
+
+- **统一判定 `shouldRecoverSession(conn, response, options)`**（请求与通知两条路径共用，
+  消除四处重复分支块）：
+  - **主判定是 404**：MCP Streamable HTTP 规范明确服务端以 404 表示会话过期/终止，
+    厂商无关、确定性判定 —— 状态码 + 守卫即可，无需读响应体（404 响应体常为空或 HTML，
+    body 嗅探不可行）。
+  - **401 是从属的非标准信号**：401 状态码无法区分鉴权失败与会话过期，必须 body 嗅探佐证
+    （`isSessionExpiredBody`：同时含 "session" 与 "expired/invalid/not found/unknown/missing"）；
+    措辞不含会话失效含义的 401 是真鉴权失败，**原样抛出**，不吞错、不空转。
+  - **会话能力守卫**：`sessionId || sessionRecovery` 两者皆无 → 直接报错。无会话服务器的
+    404/401 与会话无关，恢复必然无效；`|| sessionRecovery` 覆盖恢复窗口内的并发请求 ——
+    此时 sessionId 已被清空，但应加入在途共享恢复而不是误判为不可恢复。
+- **共享并发重建 `recoverHttpSession`**：多个请求同时撞上会话过期时共享同一个在途
+  re-initialize，避免「后完成的一方把先完成一方刚拿到的新会话作废」导致重试再次 401。
+- **重初始化防循环**：`initialize` 与 `notifications/initialized` 均固定
+  `retryOnSessionReset: false`，重初始化过程中再遇会话失效直接失败，杜绝无界循环。
+- **错误信息保真**：`buildHttpErrorFromBody` 复用已读取的响应体，避免 Response body 二次消费。
+
+### 改动文件清单
+
+| 文件 | 变更目的 |
+|---|---|
+| `src/sandbox/modules/mcp-bridge/index.ts` | 统一判定函数 + 共享并发重建 + 重初始化防循环 + 错误信息保真 |
+| `tests/mcp-bridge.test.ts` | 新增 4 用例：401 换会话重试、鉴权失败浮出、并发共享恢复且有界、恢复窗口内无会话请求加入共享恢复 |
+
+---
+
 ## 2026-09-12: 清理两处历史迁移遗留的失败测试，测试套件转为全绿
 
 `pnpm test` 长期有 9 个稳定失败 + 1 个偶发失败。逐项定性后确认**全部是测试过时，无生产代码缺陷** ——

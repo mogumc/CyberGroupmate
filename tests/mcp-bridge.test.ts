@@ -653,6 +653,139 @@ describe("mcp-bridge Streamable HTTP", () => {
         }
     });
 
+    // 恢复窗口内的并发请求：恢复开始时 sessionId 已被清空，此时新请求不带会话头，
+    // 服务端以 404 拒绝。该请求必须凭「在途恢复存在」加入共享恢复并用新会话重试，
+    // 而不是被会话能力守卫误判为不可恢复直接报错。
+    it("lets a sessionless request issued during recovery join the shared recovery", async () => {
+        initMcpBridge({ persistPath: "" });
+
+        let serverUrl = "";
+        let initializeCount = 0;
+        const toolCallSessionHeaders: string[] = [];
+
+        const server = createServer(async (req, res) => {
+            if (req.method !== "POST") {
+                res.writeHead(405);
+                res.end();
+                return;
+            }
+
+            const body = await readBody(req);
+            const msg = JSON.parse(body) as { id?: number; method?: string };
+
+            if (msg.method === "initialize") {
+                initializeCount += 1;
+                if (initializeCount === 2) {
+                    // 拖慢重建中的 initialize，保证后续无会话请求的 404 在恢复完成前到达
+                    await new Promise((resolve) => setTimeout(resolve, 80));
+                }
+                writeJson(
+                    res,
+                    {
+                        jsonrpc: "2.0",
+                        id: msg.id,
+                        result: {
+                            protocolVersion: "2025-03-26",
+                            capabilities: { tools: {} },
+                            serverInfo: { name: "mock-mcp", version: "1.0.0" },
+                        },
+                    },
+                    { "Mcp-Session-Id": `sess-${initializeCount}` },
+                );
+                return;
+            }
+
+            if (msg.method === "notifications/initialized") {
+                res.writeHead(202);
+                res.end();
+                return;
+            }
+
+            if (msg.method === "tools/list") {
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: {
+                        tools: [
+                            {
+                                name: "echo",
+                                description: "echo",
+                                inputSchema: {
+                                    type: "object",
+                                    properties: { value: { type: "string" } },
+                                },
+                            },
+                        ],
+                    },
+                });
+                return;
+            }
+
+            if (msg.method === "tools/call") {
+                const sessionId = String(req.headers["mcp-session-id"] ?? "");
+                toolCallSessionHeaders.push(sessionId);
+
+                // 初代过期会话、以及恢复窗口内不带会话的请求，都以 404 拒绝
+                if (sessionId === "sess-1" || sessionId === "") {
+                    res.writeHead(404, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        jsonrpc: "2.0",
+                        id: msg.id,
+                        error: { code: -32001, message: `session ${sessionId || "(none)"} not found` },
+                    }));
+                    return;
+                }
+                writeJson(res, {
+                    jsonrpc: "2.0",
+                    id: msg.id,
+                    result: { content: [{ type: "text", text: `ok-${msg.params?.arguments?.value ?? ""}` }] },
+                });
+                return;
+            }
+
+            res.writeHead(404);
+            res.end();
+        });
+
+        await new Promise<void>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+                const address = server.address();
+                if (!address || typeof address === "string") {
+                    throw new Error("Failed to bind mock MCP server");
+                }
+                serverUrl = `http://127.0.0.1:${address.port}/mcp`;
+                resolve();
+            });
+        });
+
+        try {
+            await mcpBridge.connect({
+                name: "demo-recovery-window",
+                description: "恢复窗口并发演示",
+                transport: "streamable-http",
+                url: serverUrl,
+            });
+
+            // A 撞上过期会话触发恢复；在恢复 initialize 返回前发出 B（此时无会话可用）
+            const callA = mcpBridge.call("demo-recovery-window", "echo", { value: "a" });
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            const callB = mcpBridge.call("demo-recovery-window", "echo", { value: "b" });
+            const results = await Promise.all([callA, callB]);
+
+            assert.deepEqual(results, ["ok-a", "ok-b"], "恢复窗口内的无会话请求也应最终成功");
+            assert.ok(
+                toolCallSessionHeaders.includes(""),
+                "应存在一次不带会话头的请求（恢复窗口内发出）",
+            );
+            assert.equal(initializeCount, 2, "B 应加入 A 触发的共享恢复，而不是再触发一次重建");
+        } finally {
+            await disconnectAll();
+            await new Promise<void>((resolve, reject) => {
+                server.close((err) => (err ? reject(err) : resolve()));
+            });
+        }
+    });
+
     it("exports and replaces global MCP configs", async () => {
         initMcpBridge({ persistPath: "" });
 
