@@ -28,8 +28,10 @@ import { isAllowedTelegramMtcutePassthroughMethod, isBlockedTelegramMtcuteNative
 
 const log = createLogger("telegram-adapter");
 const BOT_API_METHODS = new Set([
-    "telegram.getMe", "telegram.getChat", "telegram.sendText", "telegram.sendMedia",
+    "telegram.getMe", "telegram.getChat", "telegram.getUser", "telegram.sendText", "telegram.sendMedia",
     "telegram.sendFile", "telegram.sendSticker", "telegram.sendTyping", "telegram.downloadMedia",
+    "telegram.sendMediaGroup", "telegram.forwardMessage", "telegram.sendPoll", "telegram.sendReaction",
+    "telegram.editMessage", "telegram.deleteMessages", "telegram.pinMessage", "telegram.unpinMessage",
 ]);
 
 /** 白名单条目：去掉 `telegram:` 前缀并 trim，便于与 composite chatId 比对 */
@@ -801,7 +803,7 @@ export class TelegramAdapter implements PlatformAdapter {
             : baseTypeDefs.replace(/^\s*\/\/ \[USERBOT_ONLY_BEGIN\]\s*$[\s\S]*?^\s*\/\/ \[USERBOT_ONLY_END\]\s*$/gm, "");
 
         const modeNote = this.config.mode === "bot_api"
-            ? `// 当前 Telegram adapter 模式: bot_api (HTTP Bot API)\n// 仅支持: ${[...BOT_API_METHODS].join(", ")}。其他方法及 mtcute 透传不可用。\n`
+            ? `// 当前 Telegram adapter 模式: bot_api (HTTP Bot API)\n// 支持方法: ${[...BOT_API_METHODS].join(", ")}。其余方法及 mtcute 透传不可用。\n`
             : this.config.mode === "bot"
             ? "// 当前 Telegram adapter 模式: bot\n// 注意: bot mode 下不应使用历史读取、对话遍历、读回执、成员枚举等受限 API。\n"
             : "// 当前 Telegram adapter 模式: userbot\n// 可使用完整的 Telegram host proxy 能力面。\n";

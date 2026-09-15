@@ -171,6 +171,27 @@ export class TelegramBotApiClient {
 
     async sendMedia(chatId: unknown, media: unknown, opts?: unknown): Promise<unknown> {
         const value = media && typeof media === "object" ? media as Record<string, unknown> : { file: media };
+
+        // 投票走 sendPoll 端点（Bot API 的 poll 不是 InputMedia；mtcute 侧通过 InputMedia.poll 实现）
+        if (value.type === "poll") {
+            const answers = Array.isArray(value.answers) ? value.answers.map((text) => ({ text: String(text) })) : [];
+            const payload: Record<string, unknown> = {
+                chat_id: this.chatId(chatId),
+                question: typeof value.question === "string" ? value.question : String(value.question ?? ""),
+                options: answers,
+                is_anonymous: value.isAnonymous !== false,
+                ...this.replyOptions(opts),
+            };
+            if (value.quiz === true) {
+                payload.type = "quiz";
+                if (typeof value.correctOptionId === "number") payload.correct_option_id = value.correctOptionId;
+                if (typeof value.solution === "string") payload.explanation = value.solution;
+            }
+            if (value.allowMultipleAnswers === true) payload.allows_multiple_answers = true;
+            const result = await this.api<BotApiMessage>("sendPoll", payload);
+            return this.normalizeMessage(result);
+        }
+
         const type = typeof value.type === "string" ? value.type : "document";
         const methodAndField = this.mediaMethod(type, value);
         const form = new FormData();
@@ -200,6 +221,127 @@ export class TelegramBotApiClient {
 
         const result = await this.apiForm<BotApiMessage>(methodAndField.method, form);
         return this.normalizeMessage(result);
+    }
+
+    async sendMediaGroup(chatId: unknown, medias: unknown, opts?: unknown): Promise<unknown[]> {
+        const items = Array.isArray(medias) ? medias : [];
+        if (items.length < 2 || items.length > 10) {
+            throw new Error(`Telegram Bot API sendMediaGroup requires 2-10 media objects, got ${items.length}`);
+        }
+        const form = new FormData();
+        form.set("chat_id", this.chatId(chatId));
+        for (const [key, item] of Object.entries(this.replyOptions(opts))) {
+            form.set(key, String(item));
+        }
+        const attached: Array<{ field: string; bytes: Uint8Array<ArrayBuffer>; fileName: string; mime: string }> = [];
+        const inputMedia = items.map((raw, index) => {
+            const value = (raw && typeof raw === "object" ? raw : { file: raw }) as Record<string, unknown>;
+            const type = typeof value.type === "string" ? value.type : "document";
+            const methodAndField = this.mediaMethod(type, value);
+            const entry: Record<string, unknown> = { type: methodAndField.field };
+            if (typeof value.caption === "string" && value.caption) entry.caption = value.caption;
+            const file = value.file;
+            if (file instanceof Uint8Array || Buffer.isBuffer(file)) {
+                const field = `file${index}`;
+                const name = typeof value.fileName === "string" && value.fileName.trim()
+                    ? value.fileName.trim()
+                    : `${methodAndField.field}.bin`;
+                const mime = typeof value.fileMime === "string" ? value.fileMime : "application/octet-stream";
+                // Copy into a plain ArrayBuffer: Node's Buffer can be backed by a
+                // SharedArrayBuffer, which TypeScript correctly refuses as BlobPart.
+                const bytes = new Uint8Array(new ArrayBuffer(file.byteLength));
+                bytes.set(file);
+                attached.push({ field, bytes, fileName: basename(name), mime });
+                entry.media = `attach://${field}`;
+            } else if (typeof file === "string" && file.trim()) {
+                entry.media = file.trim();
+            } else {
+                throw new Error(`Telegram Bot API sendMediaGroup[${index}] requires a file_id, URL, or binary file`);
+            }
+            return entry;
+        });
+        form.set("media", JSON.stringify(inputMedia));
+        for (const item of attached) {
+            form.set(item.field, new Blob([item.bytes], { type: item.mime }), item.fileName);
+        }
+        const result = await this.apiForm<BotApiMessage[]>("sendMediaGroup", form);
+        return result.map((message) => this.normalizeMessage(message));
+    }
+
+    /** 转发消息（Bot API forwardMessages 端点）。参数形状对齐 adapter 的 forwardMessagesById 调用。 */
+    async forwardMessagesById(params: Record<string, unknown>): Promise<unknown[]> {
+        const messageIds = Array.isArray(params.messages) ? params.messages.map(Number) : [Number(params.messages)];
+        if (messageIds.length === 0 || messageIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+            throw new Error("forwardMessagesById requires positive message id(s)");
+        }
+        const payload: Record<string, unknown> = {
+            chat_id: this.chatId(params.toChatId),
+            from_chat_id: this.chatId(params.fromChatId),
+            message_ids: messageIds,
+        };
+        if (params.noAuthor === true || params.drop_author === true) payload.drop_author = true;
+        if (params.silent === true || params.disable_notification === true) payload.disable_notification = true;
+        if (params.protectContent === true || params.protect_content === true) payload.protect_content = true;
+        const result = await this.api<BotApiMessage[]>("forwardMessages", payload);
+        return result.map((message) => this.normalizeMessage(message));
+    }
+
+    async sendReaction(params: { chatId: unknown; message: unknown; emoji: unknown }): Promise<void> {
+        const emoji = params.emoji;
+        await this.api("setMessageReaction", {
+            chat_id: this.chatId(params.chatId),
+            message_id: Number(params.message),
+            reaction: emoji ? [{ type: "emoji", emoji: String(emoji) }] : [],
+        });
+    }
+
+    async editMessage(params: { chatId: unknown; message: unknown; text: unknown }): Promise<unknown> {
+        const result = await this.api<BotApiMessage>("editMessageText", {
+            chat_id: this.chatId(params.chatId),
+            message_id: Number(params.message),
+            text: typeof params.text === "string" ? params.text : String(params.text ?? ""),
+        });
+        return this.normalizeMessage(result);
+    }
+
+    /** Bot API deleteMessages 单次上限 100 条，分批提交。 */
+    async deleteMessagesById(chatId: unknown, messageIds: unknown, _opts?: unknown): Promise<void> {
+        const ids = (Array.isArray(messageIds) ? messageIds : [messageIds])
+            .map((id) => Number(id))
+            .filter((id) => Number.isSafeInteger(id) && id > 0);
+        const chat = this.chatId(chatId);
+        for (let i = 0; i < ids.length; i += 100) {
+            await this.api("deleteMessages", { chat_id: chat, message_ids: ids.slice(i, i + 100) });
+        }
+    }
+
+    async pinMessage(params: { chatId: unknown; message: unknown; notify?: boolean }): Promise<void> {
+        await this.api("pinChatMessage", {
+            chat_id: this.chatId(params.chatId),
+            message_id: Number(params.message),
+            disable_notification: params.notify !== true,
+        });
+    }
+
+    async unpinMessage(params: { chatId: unknown; message: unknown }): Promise<void> {
+        await this.api("unpinChatMessage", {
+            chat_id: this.chatId(params.chatId),
+            message_id: Number(params.message),
+        });
+    }
+
+    /** Bot API 没有 getUser 端点；对用户 ID 调 getChat 返回 private chat，映射成用户形状。 */
+    async getUser(chatId: unknown): Promise<unknown> {
+        const chat = await this.api<BotApiChat>("getChat", { chat_id: this.chatId(chatId) });
+        return {
+            id: chat.id,
+            firstName: chat.first_name,
+            lastName: chat.last_name,
+            displayName: [chat.first_name, chat.last_name].filter(Boolean).join(" ") || chat.username,
+            username: chat.username,
+            isBot: false,
+            type: "private",
+        };
     }
 
     private ensurePolling(): void {
