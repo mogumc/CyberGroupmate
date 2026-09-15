@@ -174,7 +174,12 @@ export class TelegramBotApiClient {
 
         // 投票走 sendPoll 端点（Bot API 的 poll 不是 InputMedia；mtcute 侧通过 InputMedia.poll 实现）
         if (value.type === "poll") {
-            const answers = Array.isArray(value.answers) ? value.answers.map((text) => ({ text: String(text) })) : [];
+            // answers 兼容两种来源：sandbox 直接传字符串数组，adapter 的 sendPoll case 传 [{ text }] 对象数组
+            const answers = Array.isArray(value.answers)
+                ? value.answers.map((item) => ({
+                    text: typeof item === "string" ? item : String((item as Record<string, unknown>)?.text ?? ""),
+                }))
+                : [];
             const payload: Record<string, unknown> = {
                 chat_id: this.chatId(chatId),
                 question: typeof value.question === "string" ? value.question : String(value.question ?? ""),

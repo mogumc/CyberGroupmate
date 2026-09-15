@@ -143,6 +143,8 @@ describe("Telegram Bot API client", () => {
         const api = fakeApi((method) => {
             if (method === "getFile") return ok({ file_path: "documents/file.bin" });
             if (method === "file.bin") return new Response(new Uint8Array([1, 2, 3]));
+            if (method === "sendPoll") return ok(message({ text: undefined }));
+            if (method === "sendMediaGroup") return ok([message(), message()]);
         });
         const client = new TelegramBotApiClient(token, api.fetchImpl);
         t.after(() => client.destroy());
@@ -158,6 +160,28 @@ describe("Telegram Bot API client", () => {
         await client.sendTyping(-100123);
         assert.equal(api.calls[2].method, "sendChatAction");
         assert.deepEqual(await client.downloadAsBuffer("file-id"), new Uint8Array([1, 2, 3]));
+        // sendPoll: adapter 的 sendPoll case 传 [{ text }] 对象数组，sandbox 直传则可能是字符串数组，两种都要映射成 Bot API 的 options
+        await client.sendMedia(-100123, { type: "poll", question: "Q?", answers: [{ text: "A" }, "B"], quiz: true, correctOptionId: 1 });
+        const pollCall = api.calls.find((call) => call.method === "sendPoll")!;
+        const pollPayload = JSON.parse(String(pollCall.init.body));
+        assert.deepEqual(pollPayload.options, [{ text: "A" }, { text: "B" }]);
+        assert.equal(pollPayload.question, "Q?");
+        assert.equal(pollPayload.type, "quiz");
+        assert.equal(pollPayload.correct_option_id, 1);
+        // sendMediaGroup: 二进制附件走 attach://fileN multipart，file_id 引用走 JSON 内联
+        await client.sendMediaGroup(-100123, [
+            { type: "photo", file: Buffer.from("png"), fileName: "pic.png", fileMime: "image/png" },
+            { type: "document", file: "file-id-2", caption: "doc" },
+        ], { replyTo: 41 });
+        const groupCall = api.calls.find((call) => call.method === "sendMediaGroup")!;
+        const groupForm = groupCall.init.body as FormData;
+        const groupMedia = JSON.parse(String(groupForm.get("media")));
+        assert.deepEqual(groupMedia, [
+            { type: "photo", media: "attach://file0" },
+            { type: "document", media: "file-id-2", caption: "doc" },
+        ]);
+        assert.equal((groupForm.get("file0") as File).name, "pic.png");
+        assert.equal(groupForm.get("reply_to_message_id"), "41");
         for (const result of [
             () => { throw new Error(`fetch ${token} ${encodeURIComponent(token)}`); },
             () => new Response(JSON.stringify({ ok: false, description: `error ${token}` }), { status: 401 }),
