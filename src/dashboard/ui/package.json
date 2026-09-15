@@ -15,6 +15,7 @@
     "vite": "^6.0.0"
   },
   "dependencies": {
+    "cybergroupmate-dashboard": "link:",
     "daisyui": "^5.0.0",
     "highlight.js": "^11.11.0",
     "monaco-editor": "^0.54.0",

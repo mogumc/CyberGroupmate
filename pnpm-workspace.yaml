@@ -3,5 +3,3 @@ allowBuilds:
   esbuild: true
   node-pty: true
   protobufjs: true
-patchedDependencies:
-  '@mtcute/core': patches/@mtcute__core.patch
