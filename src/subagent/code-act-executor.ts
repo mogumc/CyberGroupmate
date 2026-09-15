@@ -134,6 +134,8 @@ function formatPendingMessageLine(message: PostTaskReactionMessage, stickerDescr
     return formatMessageLine({
         id: message.messageId,
         sender: message.sender,
+        userId: message.userId,
+        mentions: message.mentions,
         text: message.text,
         timestamp: message.timestamp,
         replyTo: message.replyToMessageId ? `msg#${message.replyToMessageId}` : undefined,
@@ -160,6 +162,8 @@ function formatPendingMessages(messages: PostTaskReactionMessage[], stickerDescr
         formatMessageLine({
             id: message.messageId,
             sender: message.sender,
+            userId: message.userId,
+            mentions: message.mentions,
             text: message.text,
             timestamp: message.timestamp,
             replyTo: message.replyToMessageId ? `msg#${message.replyToMessageId}` : undefined,
@@ -622,6 +626,7 @@ export class CodeActExecutor {
         try {
             // ═══ Fix 9: 实际的 Sandbox 执行逻辑 ═══
             if (this.hasDependencies()) {
+                await this.prepareSessionForExecution();
                 callback = await this.executeWithSandbox(task, startTime);
             } else {
                 // Fallback: 无依赖时使用骨架逻辑（测试用）
@@ -667,6 +672,18 @@ export class CodeActExecutor {
 
         await this.finalizeExecutionArtifacts();
         return callback;
+    }
+
+    /** Restored history must satisfy the current policy before its first executor request. */
+    private async prepareSessionForExecution(): Promise<void> {
+        if (!this.needsCompaction()) return;
+        // Reuse structured summaries, token-aware compaction, local fallback, and persistence.
+        await this.finalizeExecutionArtifacts();
+        if (this.needsCompaction()) {
+            // Protected context can exceed the budget even after forceTrim. Do not knowingly
+            // submit the same oversized history; execute() reports a normal ERROR callback.
+            throw new Error("CodeAct session remains over the configured history budget after compaction");
+        }
     }
 
     private async finalizeExecutionArtifacts(): Promise<void> {
@@ -975,7 +992,7 @@ export class CodeActExecutor {
                 sentCollector, // Fix 1: 传入 collector
                 async () => this.drainPendingMessages(), // 层 2: turn 间消息注入
                 async () => this.drainPendingMessagesForObservation(), // 层 2: direct attention 立即并入 observation
-                `让${this.personaName}想想，`,  // prefill: 引导 LLM 以角色开始思考
+                undefined,  // Persona guidance belongs in the system prompt, not a forced assistant prefix.
                 ["[Execution Output]"],  // stop sequences
                 this.chatId,  // 关联 chatId，用于 codeActEvents 进度广播
                 this.config.maxTurns,  // 最大交互轮次
@@ -1225,6 +1242,8 @@ export class CodeActExecutor {
             chatId: this.chatId,
             msgId: msg.messageId,
             sender: msg.sender,
+            userId: msg.userId,
+            mentions: msg.mentions,
             textPreview: msg.text.length > 50 ? msg.text.slice(0, 50) + "..." : msg.text,
             directReason: msg.directReason,
             hasMedia: !!msg.mediaInfo,
@@ -1273,6 +1292,7 @@ export class CodeActExecutor {
             const replyToMsgId = message.replyToMessageId;
             const inBatchReply = replyToMsgId ? messagesById.get(replyToMsgId) : undefined;
             let replyTo = inBatchReply?.sender;
+            let replyToUserId = inBatchReply?.userId;
             let replyToText: string | undefined;
 
             if (replyToMsgId && !inBatchReply && this.memory) {
@@ -1280,6 +1300,7 @@ export class CodeActExecutor {
                     const original = this.memory.getMessageById(this.chatId, replyToMsgId);
                     if (original) {
                         replyTo = original.displayName || original.userId || `msg#${replyToMsgId}`;
+                        replyToUserId = original.userId;
                         replyToText = await resolveReplyText(original, {
                             stickerCache: this.memory,
                             visionConfig: this.visionConfig,
@@ -1301,9 +1322,12 @@ export class CodeActExecutor {
             return {
                 id: message.messageId,
                 sender: message.sender,
+                userId: message.userId,
+                mentions: message.mentions,
                 text: message.text,
                 timestamp: message.timestamp,
                 replyTo: replyTo ?? (replyToMsgId ? `msg#${replyToMsgId}` : undefined),
+                replyToUserId,
                 replyToMsgId,
                 replyToText,
                 mediaType: message.mediaType,
@@ -1414,10 +1438,14 @@ export class CodeActExecutor {
                 const isInContext = m.replyToMessageId ? msgIdToName.has(m.replyToMessageId) : false;
                 // 不在上下文中时，从 DB 查询原消息并解析文本/媒体描述（含 vision 处理）
                 let replyToText: string | undefined;
+                let replyTo = m.replyToMessageId ? msgIdToName.get(m.replyToMessageId) : undefined;
+                let replyToUserId = freshMessages.find(reply => reply.messageId === m.replyToMessageId)?.userId;
                 if (m.replyToMessageId && !isInContext && this.memory) {
                     try {
                         const origMsg = this.memory.getMessageById(this.chatId, m.replyToMessageId);
                         if (origMsg) {
+                            replyToUserId = origMsg.userId;
+                            replyTo = origMsg.displayName || origMsg.userId;
                             replyToText = await resolveReplyText(origMsg, {
                                 stickerCache: this.memory ?? undefined,
                                 visionConfig: this.visionConfig,
@@ -1432,10 +1460,13 @@ export class CodeActExecutor {
                 return {
                     id: String(m.messageId ?? m.id ?? ""),
                     sender: String(m.displayName ?? m.sender ?? m.userId ?? "?"),
+                    userId: m.userId,
+                    mentions: m.mentions,
+                    replyToUserId,
                     text: String(m.text ?? ""),
                     timestamp: String(m.timestamp ?? ""),
                     replyTo: m.replyToMessageId
-                        ? (msgIdToName.get(m.replyToMessageId) ?? `msg#${m.replyToMessageId}`)
+                        ? (replyTo ?? `msg#${m.replyToMessageId}`)
                         : undefined,
                     replyToMsgId: m.replyToMessageId ?? undefined,
                     replyToText,
@@ -1674,6 +1705,7 @@ export class CodeActExecutor {
 
         return messages.map(msg => {
             let replyTo: string | undefined;
+            let replyToUserId = messages.find(reply => reply.messageId === msg.replyToMessageId)?.userId;
             let replyToText: string | undefined;
             if (msg.replyToMessageId) {
                 replyTo = msgIdToName.get(msg.replyToMessageId);
@@ -1681,6 +1713,7 @@ export class CodeActExecutor {
                     const replied = this.memory.getMessageById(this.chatId, msg.replyToMessageId);
                     if (replied) {
                         replyTo = replied.displayName || `(uid:${replied.userId})`;
+                        replyToUserId = replied.userId;
                         replyToText = replied.text || undefined;
                     }
                 }
@@ -1690,6 +1723,9 @@ export class CodeActExecutor {
             return formatMessageLine({
                 id: msg.messageId,
                 sender: msg.displayName || `(uid:${msg.userId})`,
+                userId: msg.userId,
+                mentions: msg.mentions,
+                replyToUserId,
                 text: msg.text,
                 timestamp: msg.timestamp,
                 replyTo,

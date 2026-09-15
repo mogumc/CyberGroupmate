@@ -80,6 +80,8 @@ export interface LLMConfig {
      * 适用于某些 API 在出错时返回 200 但 content 包含错误信息的情况。
      */
     errorContentPatterns?: string[];
+    /** OpenAI Chat Completions 请求模式。仅 provider=openai 时生效；stream 在后台聚合完整输出，默认 non_stream。 */
+    chatRequestMode?: "stream" | "non_stream";
     /** OpenAI Responses API 请求模式。仅 provider=openai_responses 时生效，默认 non_stream。 */
     responsesRequestMode?: "stream" | "non_stream" | "websocket";
     /** 不发送 max_output_tokens。用于不接受该字段的 Responses 兼容网关。 */
@@ -169,23 +171,18 @@ export interface TelegramWhitelistConfig {
 }
 
 export interface TelegramConfig {
-    /**
-     * - "bot": Bot API over MTProto（mtcute，需要 api_id/api_hash）
-     * - "userbot": 用户账号 MTProto（mtcute，需要 api_id/api_hash/phone）
-     * - "botapi": 标准 Bot API over HTTP 主动拉取（getUpdates 长轮询，无需 api_id/api_hash，
-     *   接口地址可指向反向代理的 bot.telegram.org，见 api_base_url）
-     */
-    mode: "bot" | "userbot" | "botapi";
+    /** bot = MTProto bot (legacy); bot_api = HTTP Bot API; userbot = MTProto user. */
+    mode: "bot" | "bot_api" | "userbot";
     botToken: string;
     apiId: string;
     apiHash: string;
     phone: string;
     /**
-     * botapi 模式的接口根地址。默认 https://api.telegram.org；
+     * bot_api 模式的接口根地址。默认 https://api.telegram.org；
      * 可指向反向代理地址（需同时转发 /bot<token>/* 方法与 /file/bot<token>/* 文件下载）。
      */
     apiBaseUrl?: string;
-    /** botapi 模式 getUpdates 长轮询超时秒数（默认 30，上限 50） */
+    /** bot_api 模式 getUpdates 长轮询超时秒数（默认 30，上限 50） */
     pollTimeoutSec?: number;
     /** @deprecated 旧版入站白名单，仅用于迁移和 prewarm 兼容 */
     whitelist?: TelegramWhitelistConfig;
@@ -1498,6 +1495,8 @@ function parseLLMProfile(raw: Record<string, unknown>): LLMConfig {
         errorContentPatterns: (Array.isArray(raw.error_content_patterns) && raw.error_content_patterns.length > 0)
             ? raw.error_content_patterns.map(String)
             : undefined,
+        chatRequestMode: raw.chat_request_mode === "stream" ? "stream"
+            : raw.chat_request_mode === "non_stream" ? "non_stream" : undefined,
         responsesRequestMode: (str(raw.responses_request_mode) as "stream" | "non_stream" | "websocket" | undefined),
         omit_max_output_tokens: Boolean(raw.omit_max_output_tokens),
         replyPrompt: str(raw.reply_prompt),
@@ -1621,6 +1620,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (p.extraBody && Object.keys(p.extraBody).length > 0) entry.extra_body = p.extraBody;
         if (p.customHeaders && Object.keys(p.customHeaders).length > 0) entry.custom_headers = p.customHeaders;
         if (p.errorContentPatterns && p.errorContentPatterns.length > 0) entry.error_content_patterns = p.errorContentPatterns;
+        if (p.chatRequestMode) entry.chat_request_mode = p.chatRequestMode;
         if (p.responsesRequestMode) entry.responses_request_mode = p.responsesRequestMode;
         if (p.omit_max_output_tokens === true) entry.omit_max_output_tokens = true;
         if (p.replyPrompt) entry.reply_prompt = p.replyPrompt;
@@ -2120,11 +2120,11 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
     // telegram (optional)
     const tg = c.telegram as Record<string, unknown> | undefined;
     if (tg) {
-        if (!tg.mode || (tg.mode !== "bot" && tg.mode !== "userbot" && tg.mode !== "botapi")) {
-            errors.push("telegram.mode 必须是 \"bot\" / \"userbot\" / \"botapi\"");
+        if (!tg.mode || !["bot", "bot_api", "userbot"].includes(String(tg.mode))) {
+            errors.push("telegram.mode 必须是 \"bot\"、\"bot_api\" 或 \"userbot\"");
         }
-        if (tg.mode === "botapi" && !tg.botToken) {
-            errors.push("telegram.botapi 模式必须配置 bot_token（无需 api_id/api_hash）");
+        if (tg.mode === "bot_api" && !tg.botToken) {
+            errors.push("telegram.bot_api 模式必须配置 bot_token（无需 api_id/api_hash）");
         }
         // whitelist enabled + empty lists = reject all — valid config, no error
     }

@@ -38,10 +38,10 @@ import {
     readFileSync,
 } from "node:fs";
 import { join, resolve, relative } from "node:path";
+import { readMessageMentions } from "./core/message-provenance.js";
 import { createLogger } from "./core/logger.js";
 import { setGlobalTimezone, getGlobalTimezone } from "./core/timezone.js";
 import { TelegramAdapter } from "./adapter/telegram-adapter.js";
-import { TelegramBotApiAdapter } from "./adapter/telegram-botapi-adapter.js";
 import { DiscordAdapter } from "./adapter/discord-adapter.js";
 import { OneBotAdapter } from "./adapter/onebot-adapter.js";
 import { QQBotOfficialAdapter } from "./adapter/qqbot-official-adapter.js";
@@ -471,18 +471,18 @@ async function main(): Promise<void> {
     const adapters: PlatformAdapter[] = [];
 
     if (appConfig.telegram) {
-        // mode="botapi" → 标准 Bot API over HTTP 驱动（可指向反向代理的 bot.telegram.org）；
-        // bot / userbot → mtcute MTProto 驱动。两者对外接口面一致，管线无感知切换。
-        const telegramAdapter = appConfig.telegram.mode === "botapi"
-            ? new TelegramBotApiAdapter(appConfig.telegram, nc, sharedMediaDownloader)
-            : new TelegramAdapter(
-                appConfig.telegram,
-                nc,
-                promptUser,
-                (message) => console.log(`🤖 ${message}`),
-                undefined, // use default client factory
-                sharedMediaDownloader,
-            );
+        // 单一 TelegramAdapter，内部按 mode 选择驱动：
+        //   bot_api → 标准 Bot API over HTTP（getUpdates 长轮询，可指向反向代理的 bot.telegram.org）
+        //   bot / userbot → mtcute MTProto
+        // 两者对外接口面一致，管线无感知切换。
+        const telegramAdapter = new TelegramAdapter(
+            appConfig.telegram,
+            nc,
+            promptUser,
+            (message) => console.log(`🤖 ${message}`),
+            undefined, // use default client factory
+            sharedMediaDownloader,
+        );
         adapters.push(telegramAdapter);
     }
 
@@ -640,6 +640,8 @@ async function main(): Promise<void> {
         recentMessagesProvider: (chatId, limit) => memory.getRecentMessages(chatId, limit).reverse().map((message) => ({
             messageId: String(message.messageId),
             sender: String(message.displayName || message.userId || "?"),
+            userId: message.userId,
+            mentions: message.mentions,
             text: String(message.text ?? ""),
             timestamp: String(message.timestamp ?? ""),
             replyToMessageId: message.replyToMessageId ? String(message.replyToMessageId) : undefined,
@@ -718,9 +720,10 @@ async function main(): Promise<void> {
                 memory.storeMessageBatch([{
                     messageId,
                     chatId: compositeChatId,
-                    userId: agentName,
+                    userId: typeof event.senderUserId === "string" ? event.senderUserId : agentName,
                     displayName: appConfig.persona?.name ?? "赛博群友",
                     text,
+                    mentions: readMessageMentions(event.mentions),
                     replyToMessageId: event.replyToMessageId ? String(event.replyToMessageId) : undefined,
                     timestamp,
                     mediaType: mediaFields.mediaType,
@@ -803,6 +806,7 @@ async function main(): Promise<void> {
                 userId: ensureCompositeId(getPlatform(chatId), String(event.userId ?? event.user_id ?? event.senderId ?? "")),
                 displayName: String(event.displayName ?? event.senderName ?? event.userName ?? ""),
                 text: String(event.text ?? event.message ?? ""),
+                mentions: readMessageMentions(event.mentions),
                 replyToMessageId: event.replyToMessageId ? String(event.replyToMessageId) : undefined,
                 // 必须用消息原始时间：backfill 补抓的历史消息若打上"现在"，
                 // message_log 的时序（以及基于它的 LLM 上下文）会整体错乱。
@@ -960,7 +964,9 @@ async function main(): Promise<void> {
             executor.pushPendingMessage({
                 messageId: String(event.messageId ?? event.id ?? `msg_${Date.now()}`),
                 sender: String(event.displayName ?? event.senderName ?? event.userName ?? "?"),
+                userId: ensureCompositeId(getPlatform(chatId), String(event.userId ?? event.user_id ?? event.senderId ?? "")),
                 text: String(event.text ?? event.message ?? ""),
+                mentions: readMessageMentions(event.mentions),
                 timestamp: String(event.timestamp ?? new Date().toISOString()),
                 isDirectAttention,
                 directReason: directReason || undefined,

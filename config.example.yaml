@@ -80,6 +80,12 @@ llm_profiles:
   #     output: 10.00
   #     cached_input: 1.25
 
+  # provider: openai 的 profile 可设置 chat_request_mode: stream | non_stream。
+  # 默认 non_stream；stream 使用 Chat Completions SSE，在后台聚合正文、推理和用量后返回。
+  # 例如 ClinePass 等需要流式兼容的网关，设置 chat_request_mode: stream。
+  # 流式默认发送 stream_options.include_usage: true；网关不支持时可通过
+  # extra_body: { stream_options: { include_usage: false } } 覆盖。
+
   # 示例：OpenAI Responses（普通 HTTP；同样支持 encrypted reasoning 回传）
   # openai-responses:
   #   provider: openai_responses
@@ -240,27 +246,26 @@ backfill:
 # ─── Telegram 设置 ───
 # 可选。telegram 和 discord 至少配置一个。
 telegram:
-  # 连接模式: "bot" | "userbot" | "botapi"
-  #   bot:     mtcute MTProto（Bot API over MTProto，需要 api_id / api_hash）
-  #   userbot: mtcute MTProto（用户账号登录，需要 api_id / api_hash / phone）
-  #   botapi:  标准 Bot API over HTTP + getUpdates 长轮询（无需 api_id / api_hash）。
-  #            接口地址可指向反向代理的 bot.telegram.org（自建网关/反代节点），
-  #            不直连官方服务器 IP。反向代理需同时转发两类路径：
-  #              - /bot<token>/*      方法调用（sendMessage / getUpdates / ...）
-  #              - /file/bot<token>/* 文件下载（getFile 返回的 file_path）
+  # 连接模式: "bot_api" (HTTP Bot API) | "bot" (MTProto bot，旧配置保持不变) | "userbot" (MTProto 用户账号)
+  # 只使用 BotFather Token 时选择 bot_api；不会根据凭据是否留空自动切换协议。
+  # bot_api 走标准 Bot API over HTTP + getUpdates 长轮询（无需 api_id / api_hash）。
+  # 接口地址可指向反向代理的 bot.telegram.org（自建网关 / 反代节点），不直连官方服务器 IP。
+  # 反向代理需同时转发两类路径：
+  #   - /bot<token>/*      方法调用（sendMessage / getUpdates / ...）
+  #   - /file/bot<token>/* 文件下载（getFile 返回的 file_path）
   mode: bot
-  # Bot Token (bot / botapi 模式下使用)
+  # Bot Token (bot / bot_api 模式下使用)
   bot_token: ""
-  # API ID (bot / userbot 模式需要；botapi 模式无需)
+  # API ID (bot / userbot 需要；bot_api 不需要)
   api_id: ""
-  # API Hash (bot / userbot 模式需要；botapi 模式无需)
+  # API Hash (bot / userbot 需要；bot_api 不需要)
   api_hash: ""
   # 手机号 (userbot 模式下使用；首次登录时会在终端提示输入 OTP / 2FA)
   phone: ""
-  # botapi 模式专用：Bot API 接口根地址（默认 https://api.telegram.org）。
+  # bot_api 模式专用：Bot API 接口根地址（默认 https://api.telegram.org）。
   # 使用反向代理时填写代理地址，例如 "https://tg-proxy.example.com"
   # api_base_url: "https://tg-proxy.example.com"
-  # botapi 模式专用：getUpdates 长轮询超时秒数（默认 30，上限 50）
+  # bot_api 模式专用：getUpdates 长轮询超时秒数（默认 30，上限 50）
   # poll_timeout: 30
   # 拟人化发送延迟（多条消息连续发送时模拟打字速度）
   # humanized_delay:
