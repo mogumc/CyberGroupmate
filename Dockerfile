@@ -8,7 +8,6 @@ RUN npm install -g pnpm@11.3.0
 
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY patches/ ./patches/
 RUN pnpm install --frozen-lockfile
 
 # ── Stage 2: Build dashboard UI ──
