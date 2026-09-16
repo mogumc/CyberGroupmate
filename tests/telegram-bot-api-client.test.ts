@@ -151,14 +151,18 @@ describe("Telegram Bot API client", () => {
         const sent: any = await client.sendText("telegram:-100123", "reply", { replyTo: 41 });
         assert.equal(sent.id, 41);
         assert.deepEqual(JSON.parse(String(api.calls[0].init.body)), { chat_id: "-100123", text: "reply", reply_to_message_id: 41 });
+        // 沙箱可能把 replyTo 混进 text 对象（{ text, replyTo }）：正文必须拆出，回复关系必须保留，
+        // 而不是把整个对象 String() 成 "[object Object]" 发出去。
+        await client.sendText("-100123", { text: "obj-reply", replyTo: 41 });
+        assert.deepEqual(JSON.parse(String(api.calls[1].init.body)), { chat_id: "-100123", text: "obj-reply", reply_to_message_id: 41 });
         await client.sendMedia(-100123, { type: "document", file: Buffer.from("hello"), fileName: "original.txt", fileMime: "text/plain" });
-        const form = api.calls[1].init.body as FormData;
-        assert.equal(api.calls[1].method, "sendDocument");
+        const form = api.calls[2].init.body as FormData;
+        assert.equal(api.calls[2].method, "sendDocument");
         const upload = form.get("document") as File;
         assert.equal(upload.name, "original.txt");
         assert.equal(await upload.text(), "hello");
         await client.sendTyping(-100123);
-        assert.equal(api.calls[2].method, "sendChatAction");
+        assert.equal(api.calls[3].method, "sendChatAction");
         assert.deepEqual(await client.downloadAsBuffer("file-id"), new Uint8Array([1, 2, 3]));
         // sendPoll: adapter 的 sendPoll case 传 [{ text }] 对象数组，sandbox 直传则可能是字符串数组，两种都要映射成 Bot API 的 options
         await client.sendMedia(-100123, { type: "poll", question: "Q?", answers: [{ text: "A" }, "B"], quiz: true, correctOptionId: 1 });

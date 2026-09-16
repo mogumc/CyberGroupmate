@@ -157,10 +157,26 @@ export class TelegramBotApiClient {
     }
 
     async sendText(chatId: unknown, text: unknown, opts?: unknown): Promise<unknown> {
+        // 沙箱可能把回复参数混进 text 对象（如 { text, replyTo }）。拆出正文，
+        // 其余字段（replyTo / entities 等）与显式 opts 合并，归一成 Bot API 载荷，
+        // 避免正文被 String() 成 "[object Object]" 且回复关系丢失。
+        const textObj = text && typeof text === "object" ? text as Record<string, unknown> : undefined;
+        const body = typeof text === "string" ? text
+            : textObj && typeof textObj.text === "string" ? textObj.text
+            : String(text ?? "");
+        const merged: Record<string, unknown> = {
+            ...(textObj ?? {}),
+            ...(opts && typeof opts === "object" ? opts as Record<string, unknown> : {}),
+        };
+        const reply = this.replyOptions(merged);
+        delete merged.text;
+        delete merged.replyTo;
+        delete merged.reply_to_message_id;
         const result = await this.api<BotApiMessage>("sendMessage", {
             chat_id: this.chatId(chatId),
-            text: typeof text === "string" ? text : String(text ?? ""),
-            ...this.replyOptions(opts),
+            text: body,
+            ...merged,
+            ...reply,
         });
         return this.normalizeMessage(result);
     }
