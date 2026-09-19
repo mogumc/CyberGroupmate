@@ -69,6 +69,7 @@ const BUILTIN_DEBUG_DTS: Record<string, string> = {
     shell: "shell/shell.d.ts",
     telegram: "telegram/telegram.d.ts",
     discord: "discord/discord.d.ts",
+    feishu: "feishu/feishu.d.ts",
     onebot: "onebot/onebot.d.ts",
     qqbot: "qqbot/qqbot.d.ts",
     wechat: "wechat/wechat.d.ts",

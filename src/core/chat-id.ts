@@ -15,7 +15,7 @@
  */
 
 /** 支持的平台名称 */
-export type PlatformName = "telegram" | "discord" | "onebot" | "qqbot" | "wechat";
+export type PlatformName = "telegram" | "discord" | "onebot" | "qqbot" | "wechat" | "feishu";
 
 /** parseChatId 的返回结构 */
 export interface ParsedChatId {
@@ -38,7 +38,7 @@ export interface ParsedChatId {
     channelId?: string;
 }
 
-const VALID_PLATFORMS = new Set<string>(["telegram", "discord", "onebot", "qqbot", "wechat"]);
+const VALID_PLATFORMS = new Set<string>(["telegram", "discord", "onebot", "qqbot", "wechat", "feishu"]);
 
 /**
  * 创建 composite chatId。

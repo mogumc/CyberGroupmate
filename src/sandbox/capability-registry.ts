@@ -9,6 +9,7 @@ import { installRuntime } from "./modules/runtime/index.js";
 import { installSkills } from "./modules/skills/index.js";
 import { createTelegramClientProxy } from "./modules/telegram/index.js";
 import { createDiscordClientProxy } from "./modules/discord/index.js";
+import { createFeishuClientProxy } from "./modules/feishu/index.js";
 import { createOneBotClientProxy } from "./modules/onebot/index.js";
 import { createQQBotClientProxy } from "./modules/qqbot/index.js";
 import { createWeChatClientProxy } from "./modules/wechat/index.js";
@@ -18,6 +19,7 @@ import { DEFAULT_BANNED_WORDS } from "../core/banned-words.js";
 
 export interface CapabilityRegistryEnv {
     ctx: Record<string, unknown>;
+    workspace?: string;
     emitOutput: (line: string) => void;
     notifyHost: (event: Record<string, unknown>) => void;
     requestInput: (prompt: string) => Promise<string>;
@@ -82,8 +84,11 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
     let onebot: unknown = undefined;
     let qqbot: unknown = undefined;
     let wechat: unknown = undefined;
+    let feishu: unknown = undefined;
 
-    if (platform === "discord") {
+    if (platform === "feishu") {
+        feishu = createFeishuClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
+    } else if (platform === "discord") {
         discord = createDiscordClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
     } else if (platform === "onebot") {
         onebot = createOneBotClientProxy(env, sentHistory, currentDeduplicateSentMessages, currentBannedWords);
@@ -104,5 +109,6 @@ export function installCapabilityRegistry(env: CapabilityRegistryEnv): Record<st
         onebot,
         qqbot,
         wechat,
+        feishu,
     };
 }

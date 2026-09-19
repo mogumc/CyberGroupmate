@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.46.0",
+    "@larksuiteoapi/node-sdk": "1.74.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mtcute/node": "0.32.1",
     "@napi-rs/canvas": "^1.0.0",

@@ -75,6 +75,7 @@ export function platformLabel(platform) {
     case 'onebot': return 'QQ';
     case 'qqbot': return 'QQ官';
     case 'wechat': return '微信';
+    case 'feishu': return '飞书';
     default: return platform.toUpperCase().slice(0, 2);
   }
 }
