@@ -47,7 +47,7 @@ const FEISHU_WRITE_ACTIONS = new Set([
     "messageReaction.create", "messageReaction.delete", "pin.create", "pin.delete",
     "chat.update", "chat.delete", "chatMembers.create", "chatMembers.delete", "chatMembers.meJoin",
     "chatManagers.addManagers", "chatManagers.deleteManagers", "chatMenuTree.create", "chatMenuTree.delete",
-    "chatMenuTree.patch", "chatMenuTree.sort", "chatMenuItem.patch",
+    "chatMenuTree.sort", "chatMenuItem.patch",
 ]);
 
 export interface ManagedEnvPlan {

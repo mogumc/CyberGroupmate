@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import type { CapabilityRegistryEnv } from "../../capability-registry.js";
-import type { FeishuClient, FeishuMedia, FeishuMessageAck, FeishuSendOptions } from "./feishu.js";
+import type { FeishuClient, FeishuMedia, FeishuMessageAck, FeishuSendOptions, FeishuTextOptions } from "./feishu.js";
 import { DEFAULT_BANNED_WORDS, findBannedWords, buildBannedWordWarning } from "../../../core/banned-words.js";
 
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
@@ -70,13 +70,13 @@ export function createFeishuClientProxy(
     bannedWords: string[] = DEFAULT_BANNED_WORDS,
 ): FeishuClient {
     const workspace = resolve(env.workspace ?? process.cwd());
-    const pending = new Map<string, Promise<FeishuMessageAck>>();
+    const pending = new Map<string, Promise<unknown>>();
 
     async function send(
         method: SendMethod,
         chatId: string,
         payload: SendPayload,
-        options?: FeishuSendOptions,
+        options?: FeishuTextOptions,
     ): Promise<FeishuMessageAck | null> {
         chatId = canonicalChatId(chatId);
         const text = payloadText(method, payload);
@@ -200,7 +200,71 @@ export function createFeishuClientProxy(
         getMessage: async (chatId, messageId) => env.callHost("feishu.getMessage", [canonicalChatId(chatId), messageId]),
         getHistory: async (chatId, options) => env.callHost("feishu.getHistory", [canonicalChatId(chatId), options]) as Promise<{ items: unknown[]; hasMore: boolean; pageToken?: string }>,
         getChat: async chatId => env.callHost("feishu.getChat", [canonicalChatId(chatId)]),
-        callApi: async (chatId, action, payload) => env.callHost("feishu.callApi", [canonicalChatId(chatId), action, payload]),
+        callApi: async (chatId, action, payload = {}) => {
+            chatId = canonicalChatId(chatId);
+            if (action !== "message.forward" && action !== "message.mergeForward") {
+                return env.callHost("feishu.callApi", [chatId, action, payload]);
+            }
+            const key = JSON.stringify(["callApi", action, payload]);
+            const pendingKey = JSON.stringify([chatId, key]);
+            if (deduplicateSentMessages) {
+                while (pending.has(pendingKey)) await pending.get(pendingKey)!.catch(() => undefined);
+                if (sentHistory.get(chatId)?.has(key)) {
+                    env.emitOutput(`[Feishu] Duplicate message blocked chat=${chatId}`);
+                    env.notifyHost({
+                        type: "system.duplicate_message_blocked",
+                        scene: "feishu",
+                        chatId,
+                        text: `[${action}]`,
+                        timestamp: Date.now(),
+                    });
+                    return null;
+                }
+            }
+            const operation = (async () => {
+                const result = await env.callHost("feishu.callApi", [chatId, action, payload]);
+                const raw = result && typeof result === "object" && !Array.isArray(result) ? result as Record<string, unknown> : {};
+                const data = raw.data && typeof raw.data === "object" && !Array.isArray(raw.data) ? raw.data as Record<string, unknown> : {};
+                const message = action === "message.mergeForward" && data.message && typeof data.message === "object" && !Array.isArray(data.message)
+                    ? data.message as Record<string, unknown>
+                    : data;
+                const ack = requireAck({
+                    messageId: message.message_id,
+                    chatId: message.chat_id ?? chatId,
+                    senderUserId: message.sender && typeof message.sender === "object"
+                        ? (message.sender as Record<string, unknown>).id
+                        : undefined,
+                    parentId: message.parent_id,
+                    rootId: message.root_id,
+                    threadId: message.thread_id,
+                }, "sendMessage", chatId);
+                if (deduplicateSentMessages) {
+                    const history = sentHistory.get(chatId) ?? new Set<string>();
+                    history.add(key);
+                    sentHistory.set(chatId, history);
+                }
+                env.emitOutput(`[Feishu] ${action} ok chat=${chatId} msg=${ack.messageId}`);
+                env.notifyHost({
+                    type: "system.agent_message_sent",
+                    scene: "feishu",
+                    chatId,
+                    messageId: ack.messageId,
+                    text: `[${action}]`,
+                    senderUserId: ack.senderUserId,
+                    parentId: ack.parentId,
+                    rootId: ack.rootId,
+                    threadId: ack.threadId,
+                    timestamp: Date.now(),
+                });
+                return result;
+            })();
+            if (deduplicateSentMessages) pending.set(pendingKey, operation);
+            try {
+                return await operation;
+            } finally {
+                if (pending.get(pendingKey) === operation) pending.delete(pendingKey);
+            }
+        },
         downloadMedia: async (fileId, chatId, messageId, uniqueFileId) => {
             const result = await env.callHost("feishu.downloadMedia", [
                 fileId,

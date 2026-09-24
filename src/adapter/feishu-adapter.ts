@@ -119,7 +119,7 @@ const FEISHU_NATIVE_ACTIONS = new Set([
     "chat.update", "chat.delete", "chat.link",
     "chatMembers.create", "chatMembers.delete", "chatMembers.meJoin", "chatMembers.get", "chatMembers.isInChat",
     "chatManagers.addManagers", "chatManagers.deleteManagers",
-    "chatMenuTree.create", "chatMenuTree.delete", "chatMenuTree.patch", "chatMenuTree.sort",
+    "chatMenuTree.create", "chatMenuTree.delete", "chatMenuTree.sort",
     "chatMenuItem.patch",
 ]);
 const MESSAGE_TYPES = new Set(["text", "post", "interactive", "share_chat", "share_user"]);

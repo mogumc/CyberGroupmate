@@ -1,8 +1,11 @@
 export interface FeishuSendOptions {
     replyToMessageId?: string;
     replyInThread?: boolean;
-    mentions?: Array<{ userId: string; displayName?: string }>;
     uuid?: string;
+}
+
+export interface FeishuTextOptions extends FeishuSendOptions {
+    mentions?: Array<{ userId: string; displayName?: string }>;
 }
 
 export interface FeishuMedia {
@@ -20,7 +23,7 @@ export type FeishuNativeAction =
     | "chat.update" | "chat.delete" | "chat.link"
     | "chatMembers.create" | "chatMembers.delete" | "chatMembers.meJoin" | "chatMembers.get" | "chatMembers.isInChat"
     | "chatManagers.addManagers" | "chatManagers.deleteManagers"
-    | "chatMenuTree.create" | "chatMenuTree.delete" | "chatMenuTree.patch" | "chatMenuTree.sort"
+    | "chatMenuTree.create" | "chatMenuTree.delete" | "chatMenuTree.sort"
     | "chatMenuItem.patch";
 
 export interface FeishuMessageAck {
@@ -46,7 +49,7 @@ export interface FeishuCardUpdateOptions {
 }
 
 export interface FeishuClient {
-    sendText(chatId: string, text: string, options?: FeishuSendOptions): Promise<FeishuMessageAck | null>;
+    sendText(chatId: string, text: string, options?: FeishuTextOptions): Promise<FeishuMessageAck | null>;
     /** 发送飞书原生 text/post/interactive/share_chat/share_user 消息。 */
     sendMessage(chatId: string, type: "text" | "post" | "interactive" | "share_chat" | "share_user", content: Record<string, unknown>, options?: FeishuSendOptions): Promise<FeishuMessageAck | null>;
     sendMedia(chatId: string, media: FeishuMedia, options?: FeishuSendOptions): Promise<FeishuMessageAck | null>;

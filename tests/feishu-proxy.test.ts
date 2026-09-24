@@ -328,6 +328,34 @@ describe("Feishu sandbox API boundary", () => {
         await assert.rejects(h.proxy.getChat("telegram:oc_test"), /chatId/);
     });
 
+    it("tracks and deduplicates native forwarding sends", async () => {
+        let call = 0;
+        const h = harness(async (_method, args) => {
+            call += 1;
+            const action = args?.[1];
+            return action === "message.mergeForward"
+                ? { data: { message: { message_id: `om_merge_${call}`, chat_id: "oc_test" } } }
+                : { data: { message_id: `om_forward_${call}`, chat_id: "oc_test" } };
+        });
+        const forwardPayload = {
+            path: { message_id: "om_source" },
+            params: { receive_id_type: "chat_id" },
+            data: { receive_id: "oc_test" },
+        };
+        const mergePayload = {
+            params: { receive_id_type: "chat_id" },
+            data: { receive_id: "oc_test", message_id_list: ["om_source"] },
+        };
+
+        await h.proxy.callApi("oc_test", "message.forward", forwardPayload);
+        assert.equal(await h.proxy.callApi("oc_test", "message.forward", forwardPayload), null);
+        await h.proxy.callApi("oc_test", "message.mergeForward", mergePayload);
+
+        assert.equal(h.calls.length, 2);
+        assert.deepEqual(h.events.filter(event => event.type === "system.agent_message_sent").map(event => event.messageId), ["om_forward_1", "om_merge_2"]);
+        assert.equal(h.events.filter(event => event.type === "system.duplicate_message_blocked").length, 1);
+    });
+
     it("forwards sticker and card operations and archives only newly sent messages", async () => {
         let messageId = 0;
         const h = harness(async method => method.startsWith("feishu.send") ? { messageId: `om_sent_${++messageId}` } : { updated: true });
