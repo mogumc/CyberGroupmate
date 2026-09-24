@@ -18,6 +18,11 @@ function canonicalChatId(chatId: string): string {
     return chatId.startsWith("feishu:") ? chatId : `feishu:${chatId}`;
 }
 
+function canonicalSenderUserId(userId: unknown): string | undefined {
+    if (typeof userId !== "string" || !/^(?:feishu:)?ou_[A-Za-z0-9_-]+$/.test(userId)) return undefined;
+    return userId.startsWith("feishu:") ? userId : `feishu:${userId}`;
+}
+
 function payloadText(method: SendMethod, payload: SendPayload): string {
     if (method === "sendSticker") return "[sticker]";
     if (typeof payload === "string") return payload;
@@ -72,6 +77,27 @@ export function createFeishuClientProxy(
     const workspace = resolve(env.workspace ?? process.cwd());
     const pending = new Map<string, Promise<unknown>>();
 
+    function blockBannedText(chatId: string, text: string): boolean {
+        const foundWords = findBannedWords(text, bannedWords);
+        if (foundWords.length === 0) return false;
+        env.emitOutput(buildBannedWordWarning(foundWords, text));
+        env.notifyHost({
+            type: "system.banned_word_blocked",
+            scene: "feishu",
+            chatId,
+            text,
+            foundWords,
+            timestamp: Date.now(),
+        });
+        return true;
+    }
+
+    function callMutation(method: string, chatId: string, text: string, args: unknown[]): Promise<unknown> | null {
+        chatId = canonicalChatId(chatId);
+        if (blockBannedText(chatId, text)) return null;
+        return env.callHost(method, [chatId, ...args]);
+    }
+
     async function send(
         method: SendMethod,
         chatId: string,
@@ -80,19 +106,7 @@ export function createFeishuClientProxy(
     ): Promise<FeishuMessageAck | null> {
         chatId = canonicalChatId(chatId);
         const text = payloadText(method, payload);
-        const foundWords = findBannedWords(text, bannedWords);
-        if (foundWords.length > 0) {
-            env.emitOutput(buildBannedWordWarning(foundWords, text));
-            env.notifyHost({
-                type: "system.banned_word_blocked",
-                scene: "feishu",
-                chatId,
-                text,
-                foundWords,
-                timestamp: Date.now(),
-            });
-            return null;
-        }
+        if (blockBannedText(chatId, text)) return null;
 
         const key = JSON.stringify([
             method,
@@ -193,16 +207,17 @@ export function createFeishuClientProxy(
         sendSticker: async (chatId, fileId, options) => send("sendSticker", chatId, fileId, options),
         sendTemplateCard: async (chatId, templateId, variables = {}, options) => send("sendTemplateCard", chatId, { templateId, variables }, options),
         sendCard: async (chatId, card, options) => send("sendCard", chatId, { card }, options),
-        updateTemplateCard: async (chatId, messageId, templateId, variables = {}) => env.callHost("feishu.updateTemplateCard", [canonicalChatId(chatId), messageId, templateId, variables]),
-        updateCard: async (chatId, messageId, card, options) => env.callHost("feishu.updateCard", [canonicalChatId(chatId), messageId, card, options]),
-        patchCard: async (chatId, messageId, actions, options) => env.callHost("feishu.patchCard", [canonicalChatId(chatId), messageId, actions, options]),
-        streamCardText: async (chatId, messageId, elementId, content, options) => env.callHost("feishu.streamCardText", [canonicalChatId(chatId), messageId, elementId, content, options]),
+        updateTemplateCard: async (chatId, messageId, templateId, variables = {}) => callMutation("feishu.updateTemplateCard", chatId, JSON.stringify(variables), [messageId, templateId, variables]),
+        updateCard: async (chatId, messageId, card, options) => callMutation("feishu.updateCard", chatId, JSON.stringify(card), [messageId, card, options]),
+        patchCard: async (chatId, messageId, actions, options) => callMutation("feishu.patchCard", chatId, JSON.stringify(actions), [messageId, actions, options]),
+        streamCardText: async (chatId, messageId, elementId, content, options) => callMutation("feishu.streamCardText", chatId, content, [messageId, elementId, content, options]),
         getMessage: async (chatId, messageId) => env.callHost("feishu.getMessage", [canonicalChatId(chatId), messageId]),
         getHistory: async (chatId, options) => env.callHost("feishu.getHistory", [canonicalChatId(chatId), options]) as Promise<{ items: unknown[]; hasMore: boolean; pageToken?: string }>,
         getChat: async chatId => env.callHost("feishu.getChat", [canonicalChatId(chatId)]),
         callApi: async (chatId, action, payload = {}) => {
             chatId = canonicalChatId(chatId);
             if (action !== "message.forward" && action !== "message.mergeForward") {
+                if (blockBannedText(chatId, JSON.stringify(payload))) return null;
                 return env.callHost("feishu.callApi", [chatId, action, payload]);
             }
             const key = JSON.stringify(["callApi", action, payload]);
@@ -232,7 +247,7 @@ export function createFeishuClientProxy(
                     messageId: message.message_id,
                     chatId: message.chat_id ?? chatId,
                     senderUserId: message.sender && typeof message.sender === "object"
-                        ? (message.sender as Record<string, unknown>).id
+                        ? canonicalSenderUserId((message.sender as Record<string, unknown>).id)
                         : undefined,
                     parentId: message.parent_id,
                     rootId: message.root_id,

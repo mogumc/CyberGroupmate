@@ -334,8 +334,8 @@ describe("Feishu sandbox API boundary", () => {
             call += 1;
             const action = args?.[1];
             return action === "message.mergeForward"
-                ? { data: { message: { message_id: `om_merge_${call}`, chat_id: "oc_test" } } }
-                : { data: { message_id: `om_forward_${call}`, chat_id: "oc_test" } };
+                ? { data: { message: { message_id: `om_merge_${call}`, chat_id: "oc_test", sender: { id: "ou_bot" } } } }
+                : { data: { message_id: `om_forward_${call}`, chat_id: "oc_test", sender: { id: "feishu:ou_bot" } } };
         });
         const forwardPayload = {
             path: { message_id: "om_source" },
@@ -352,8 +352,22 @@ describe("Feishu sandbox API boundary", () => {
         await h.proxy.callApi("oc_test", "message.mergeForward", mergePayload);
 
         assert.equal(h.calls.length, 2);
-        assert.deepEqual(h.events.filter(event => event.type === "system.agent_message_sent").map(event => event.messageId), ["om_forward_1", "om_merge_2"]);
+        const sent = h.events.filter(event => event.type === "system.agent_message_sent");
+        assert.deepEqual(sent.map(event => event.messageId), ["om_forward_1", "om_merge_2"]);
+        assert.deepEqual(sent.map(event => event.senderUserId), ["feishu:ou_bot", "feishu:ou_bot"]);
         assert.equal(h.events.filter(event => event.type === "system.duplicate_message_blocked").length, 1);
+    });
+
+    it("blocks banned text in message and card mutations", async () => {
+        const h = harness(async () => ({ updated: true }), ["forbidden"]);
+        assert.equal(await h.proxy.updateTemplateCard("oc_test", "om_card", "template", { text: "forbidden" }), null);
+        assert.equal(await h.proxy.updateCard("oc_test", "om_card", { elements: [{ text: "forbidden" }] }), null);
+        assert.equal(await h.proxy.patchCard("oc_test", "om_card", [{ content: "forbidden" }]), null);
+        assert.equal(await h.proxy.streamCardText("oc_test", "om_card", "answer", "forbidden"), null);
+        assert.equal(await h.proxy.callApi("oc_test", "message.update", { path: { message_id: "om_card" }, data: { content: "forbidden" } }), null);
+        assert.equal(h.calls.length, 0);
+        assert.equal(h.events.length, 5);
+        assert.ok(h.events.every(event => event.type === "system.banned_word_blocked"));
     });
 
     it("forwards sticker and card operations and archives only newly sent messages", async () => {
