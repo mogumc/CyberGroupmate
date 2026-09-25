@@ -375,6 +375,24 @@ describe("Feishu adapter ingress edges", () => {
         await rejected;
         assert.equal(f.events.length, 0);
     });
+
+    it("does not deliver card actions or reactions after their session stops", async () => {
+        for (const eventType of ["card.action.trigger", "im.message.reaction.created_v1"] as const) {
+            let release!: (value: { code: number; data: { user: { name: string } } }) => void;
+            const f = fixture();
+            f.client.contact!.v3!.user!.get = () => new Promise(resolve => { release = resolve; });
+            f.messages.set("om_bot", { message_id: "om_bot", chat_id: "oc_chat", chat_type: "group", msg_type: "text", body: { content: '{"text":"bot message"}' }, sender: { id: "ou_bot", id_type: "open_id" }, create_time: time });
+            await f.adapter.start();
+            const delivery = eventType === "card.action.trigger"
+                ? f.connections[0].handlers[eventType]({ event_id: "evt_card", event: { operator: { open_id: "ou_user" }, action: { name: "approve" }, context: { open_chat_id: "oc_chat", open_message_id: "om_bot" } } })
+                : f.connections[0].handlers[eventType]({ event_id: "evt_reaction", event: { message_id: "om_bot", user_id: { open_id: "ou_user" }, reaction_type: { emoji_type: "THUMBSUP" }, action_time: time } });
+            await waitFor(() => Boolean(release));
+            await f.adapter.stop();
+            release({ code: 0, data: { user: { name: "Alice" } } });
+            await delivery;
+            assert.equal(f.events.length, 0);
+        }
+    });
 });
 
 describe("Feishu adapter lifecycle edges", () => {
@@ -452,6 +470,21 @@ describe("Feishu adapter lifecycle edges", () => {
 });
 
 describe("Feishu adapter host boundary edges", () => {
+    it("blocks muted native writes while allowing native reads", async () => {
+        const f = fixture();
+        const nativeCalls: unknown[] = [];
+        const native = async (payload: unknown) => { nativeCalls.push(payload); return { code: 0, data: {} }; };
+        f.client.im.v1.pin = { create: native, list: native };
+        await f.adapter.start();
+        try {
+            f.adapter.muteChat("oc_chat", 1);
+            await assert.rejects(f.adapter.callApi("oc_chat", "pin.create", { data: { message_id: "om_parent" } }), /chat is muted/);
+            assert.equal(nativeCalls.length, 0);
+            await f.adapter.callApi("oc_chat", "pin.list", { params: { chat_id: "oc_chat" } });
+            assert.deepEqual(nativeCalls, [{ params: { chat_id: "oc_chat" } }]);
+        } finally { await f.adapter.stop(); }
+    });
+
     it("rejects unscoped forwarding and checks every native message owner before mutation", async () => {
         const f = fixture();
         f.messages.set("om_other", { ...f.messages.get("om_parent"), message_id: "om_other", chat_id: "oc_other" });

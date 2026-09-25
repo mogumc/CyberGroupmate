@@ -122,6 +122,10 @@ const FEISHU_NATIVE_ACTIONS = new Set([
     "chatMenuTree.create", "chatMenuTree.delete", "chatMenuTree.sort",
     "chatMenuItem.patch",
 ]);
+const FEISHU_NATIVE_READ_ACTIONS = new Set([
+    "message.readUsers", "messageReaction.list", "messageReaction.batchQuery", "pin.list",
+    "chat.link", "chatMembers.get", "chatMembers.isInChat",
+]);
 const MESSAGE_TYPES = new Set(["text", "post", "interactive", "share_chat", "share_user"]);
 const MEDIA_TYPES = new Set(["photo", "document", "audio", "video"]);
 const FEISHU_WRITE_METHODS = [
@@ -397,7 +401,7 @@ export class FeishuAdapter implements PlatformAdapter {
             ];
             const handlers: FeishuEventHandlers = {
                 "im.message.receive_v1": receive,
-                "card.action.trigger": async event => current() ? this.receiveCardAction(event) : {},
+                "card.action.trigger": async event => current() ? this.receiveCardAction(event, session) : {},
                 "im.message.reaction.created_v1": async event => { if (current()) await this.receiveReaction(event, "added", session); },
                 "im.message.reaction.deleted_v1": async event => { if (current()) await this.receiveReaction(event, "removed", session); },
             };
@@ -528,11 +532,12 @@ export class FeishuAdapter implements PlatformAdapter {
         }
     }
 
-    private async deliverSynthetic(eventId: string, chatId: string, input: NotificationInput): Promise<void> {
-        if (this.seen.has(eventId) || this.pending.has(eventId)) return;
+    private async deliverSynthetic(eventId: string, chatId: string, input: NotificationInput, session: AbortController): Promise<void> {
+        if (session.signal.aborted || this.session !== session || this.seen.has(eventId) || this.pending.has(eventId)) return;
         this.pending.add(eventId);
         try {
             const exists = this.dependencies.hasMessage ? await this.dependencies.hasMessage(chatId, eventId) : false;
+            if (session.signal.aborted || this.session !== session) return;
             if (!exists) this.nc.push(input);
             this.seen.set(eventId, Date.now());
             trimMap(this.seen, this.dedupLimit);
@@ -576,7 +581,7 @@ export class FeishuAdapter implements PlatformAdapter {
         };
     }
 
-    private async receiveCardAction(value: unknown): Promise<RecordValue> {
+    private async receiveCardAction(value: unknown, session: AbortController): Promise<RecordValue> {
         const outer = record(value);
         const event = outer.event ? record(outer.event) : outer;
         const context = record(event.context);
@@ -593,7 +598,9 @@ export class FeishuAdapter implements PlatformAdapter {
             || createHash("sha256").update(JSON.stringify([messageId, userRaw, action])).digest("hex")}`;
         const text = `[Card action${string(action.name) ? `: ${string(action.name)}` : ""}] ${JSON.stringify(detail)}`.slice(0, MAX_TEXT_BYTES);
         const displayName = string(operator.name) || await this.resolveUserName(userRaw) || userId;
+        if (session.signal.aborted || this.session !== session) return {};
         await this.ensureChatMetadata(chatId);
+        if (session.signal.aborted || this.session !== session) return {};
         await this.deliverSynthetic(eventId, chatId, this.syntheticNotification({
             chatId, userId, displayName, messageId: eventId, text,
             timestamp: timestamp(outer.create_time ?? event.create_time),
@@ -601,7 +608,7 @@ export class FeishuAdapter implements PlatformAdapter {
             mentionsAgent: true, replyToMessageId: messageId,
             platformData: { originalType: "card.action.trigger", action, context },
             urgent: true,
-        }));
+        }), session);
         return {};
     }
 
@@ -613,6 +620,7 @@ export class FeishuAdapter implements PlatformAdapter {
         const emoji = string(record(event.reaction_type).emoji_type);
         if (!ID_PATTERNS.om_.test(messageId) || !ID_PATTERNS.ou_.test(userRaw) || !emoji) return;
         const response = await bounded(this.api(() => this.requireClient().im.v1.message.get({ path: { message_id: messageId }, params: { user_id_type: "open_id", with_sender_name: true } })), this.requestTimeoutMs, session.signal);
+        if (session.signal.aborted || this.session !== session) return;
         const items = Array.isArray(record(response.data).items) ? record(response.data).items as unknown[] : [];
         const original = items.map(record).find(item => item.message_id === messageId);
         if (!original || original.deleted) return;
@@ -622,7 +630,9 @@ export class FeishuAdapter implements PlatformAdapter {
         const userId = compositeId(userRaw, "ou_");
         const eventId = `feishu-reaction:${string(outer.event_id ?? event.event_id ?? outer.uuid ?? event.uuid) || `${messageId}:${userRaw}:${emoji}:${action}:${string(event.action_time)}`}`;
         const displayName = await this.resolveUserName(userRaw) ?? userId;
+        if (session.signal.aborted || this.session !== session) return;
         await this.ensureChatMetadata(chatId);
+        if (session.signal.aborted || this.session !== session) return;
         const chatType = string(original.chat_type) || this.chatTypes.get(chatId);
         const text = `[Reaction ${action}: ${emoji}]`;
         const originalSender = record(original.sender);
@@ -633,7 +643,7 @@ export class FeishuAdapter implements PlatformAdapter {
             chatType: normalizedType, mentionsAgent: reactedToBot, replyToMessageId: messageId,
             platformData: { originalType: `im.message.reaction.${action === "added" ? "created" : "deleted"}_v1`, reactionAction: action, emoji },
             urgent: reactedToBot || normalizedType === "private",
-        }));
+        }), session);
     }
 
     private normalize(message: RecordValue, sender: RecordValue, chatType?: string): RecordValue {
@@ -1170,6 +1180,7 @@ export class FeishuAdapter implements PlatformAdapter {
     async callApi(chatId: string, action: string, payload: RecordValue = {}): Promise<unknown> {
         const expectedChatId = rawId(chatId, "oc_");
         if (!FEISHU_NATIVE_ACTIONS.has(action)) throw new Error("Unsupported Feishu native action");
+        if (!FEISHU_NATIVE_READ_ACTIONS.has(action)) this.assertWritable(chatId);
         const [resourceName, methodName] = action.split(".");
         const path = record(payload.path);
         const params = record(payload.params);
