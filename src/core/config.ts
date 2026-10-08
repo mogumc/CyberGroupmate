@@ -201,6 +201,14 @@ export interface TelegramConfig {
     };
 }
 
+export interface FeishuConfig {
+    appId: string;
+    appSecret: string;
+    domain?: "feishu" | "lark";
+}
+
+export const FEISHU_APP_ID_PATTERN = /^cli_[0-9a-fA-F]{16}$/;
+
 export interface DiscordConfig {
     botToken: string;
     applicationId?: string;
@@ -647,6 +655,7 @@ export interface AppConfig {
     timezone?: string;
     telegram?: TelegramConfig;
     discord?: DiscordConfig;
+    feishu?: FeishuConfig;
     onebot?: OneBotConfig;
     /** QQ 官方机器人（开放平台 WebSocket 网关 + REST v2） */
     qqbot?: QQBotConfig;
@@ -692,6 +701,8 @@ export interface AppConfig {
         schedule?: string;
         /** 定时做梦的强制最小间隔（小时）。距上次做梦不足此值时，定时触发被忽略。默认 6，设 0 关闭。 */
         minIntervalHours?: number;
+        /** 空闲巡视的最小间隔（小时）。距上次做梦不足此值时，空闲触发被忽略。默认 2，设 0 关闭。真实通知不受限。 */
+        idleMinIntervalHours?: number;
         maxBudgetUsd?: number;
         extraArgs?: string[];
         /** @deprecated use harnessModel */
@@ -742,7 +753,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
     if (existsSync(path)) {
         try {
             const raw = readFileSync(path, "utf-8");
-            fileConfig = parseYAML(raw) ?? {};
+            fileConfig = parseYAML(raw, { merge: true }) ?? {};
         } catch (err) {
             console.error(`[Config] config.yaml 解析错误: ${err instanceof Error ? err.message : err}`);
         }
@@ -833,6 +844,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
             description: str(filePersona.description) ?? "",
         },
         timezone: str(fileConfig.timezone),
+        feishu: parseFeishuConfig(fileConfig.feishu),
         telegram: Object.keys(fileTG).length > 0 ? {
             mode: (str(fileTG.mode) as TelegramConfig["mode"]) ?? "bot",
             botToken: str(fileTG.bot_token) ?? "",
@@ -1055,6 +1067,7 @@ function stringList(value: unknown): string[] | undefined {
 /** Convert adapter-local allowlists into one global whitelist on load. */
 function migrateLegacyWhitelists(fileConfig: Record<string, unknown>): ChatFilterConfig | undefined {
     const telegram = (fileConfig.telegram ?? {}) as Record<string, unknown>;
+    const feishu = (fileConfig.feishu ?? {}) as Record<string, unknown>;
     const discord = (fileConfig.discord ?? {}) as Record<string, unknown>;
     const onebot = (fileConfig.onebot ?? {}) as Record<string, unknown>;
     const telegramWhitelist = telegram.whitelist as Record<string, unknown> | undefined;
@@ -1098,8 +1111,42 @@ function migrateLegacyWhitelists(fileConfig: Record<string, unknown>): ChatFilte
     }
 
     if (Object.keys(discord).length > 0) add("discord:*");
+    if (typeof feishu.app_id === "string" && feishu.app_id.trim()
+        && typeof feishu.app_secret === "string" && feishu.app_secret.trim()) add("feishu:*");
 
     return { enabled: true, mode: "whitelist", chatIds, userIds: [] };
+}
+
+function parseFeishuConfig(value: unknown, runtime = false): FeishuConfig | undefined {
+    if (value == null) return undefined;
+    if (typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("feishu must be an object or null");
+    }
+    const raw = value as Record<string, unknown>;
+    const idKey = runtime ? "appId" : "app_id";
+    const secretKey = runtime ? "appSecret" : "app_secret";
+    for (const key of [idKey, secretKey]) {
+        if (raw[key] != null && typeof raw[key] !== "string") {
+            throw new Error(`feishu.${key} must be a string`);
+        }
+    }
+    if (raw.domain !== undefined && raw.domain !== "feishu" && raw.domain !== "lark") {
+        throw new Error('feishu.domain must be "feishu" or "lark"');
+    }
+    const appId = (raw[idKey] as string | undefined)?.trim() ?? "";
+    const appSecret = (raw[secretKey] as string | undefined)?.trim() ?? "";
+    if (!appId && !appSecret) return undefined;
+    if (!appId || !appSecret) {
+        throw new Error(`feishu.${idKey} and feishu.${secretKey} must both be non-empty`);
+    }
+    if (!FEISHU_APP_ID_PATTERN.test(appId)) {
+        throw new Error(`feishu.${idKey} must match cli_ followed by 16 hexadecimal characters`);
+    }
+    return {
+        appId,
+        appSecret,
+        ...(raw.domain !== undefined ? { domain: raw.domain as FeishuConfig["domain"] } : {}),
+    };
 }
 
 function parseBackfillConfig(fileConfig: Record<string, unknown>): BackfillConfig | undefined {
@@ -1392,6 +1439,7 @@ function parseBackgroundAgentConfig(fileConfig: Record<string, unknown>): AppCon
         claudeModel: str(raw.claude_model) ?? undefined,
         schedule: str(raw.schedule) ?? undefined,
         minIntervalHours: raw.min_interval_hours != null ? num(raw.min_interval_hours, 6) : undefined,
+        idleMinIntervalHours: raw.idle_min_interval_hours != null ? num(raw.idle_min_interval_hours, 2) : undefined,
         maxBudgetUsd: raw.max_budget_usd != null ? num(raw.max_budget_usd, 5) : undefined,
         extraArgs: Array.isArray(raw.extra_args) ? (raw.extra_args as unknown[]).map(String) : undefined,
     };
@@ -1697,6 +1745,15 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
             tg.prewarm = { groups: prewarmGroups };
         }
         obj.telegram = tg;
+    }
+
+    const feishu = parseFeishuConfig(config.feishu, true);
+    if (feishu) {
+        obj.feishu = {
+            app_id: feishu.appId,
+            app_secret: feishu.appSecret,
+            ...(feishu.domain !== undefined ? { domain: feishu.domain } : {}),
+        };
     }
 
     // discord
@@ -2008,6 +2065,7 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (config.backgroundAgent.claudeModel != null) ba.claude_model = config.backgroundAgent.claudeModel;
         if (config.backgroundAgent.schedule != null) ba.schedule = config.backgroundAgent.schedule;
         if (config.backgroundAgent.minIntervalHours != null) ba.min_interval_hours = config.backgroundAgent.minIntervalHours;
+        if (config.backgroundAgent.idleMinIntervalHours != null) ba.idle_min_interval_hours = config.backgroundAgent.idleMinIntervalHours;
         if (config.backgroundAgent.maxBudgetUsd != null) ba.max_budget_usd = config.backgroundAgent.maxBudgetUsd;
         if (config.backgroundAgent.extraArgs && config.backgroundAgent.extraArgs.length > 0) ba.extra_args = config.backgroundAgent.extraArgs;
         if (Object.keys(ba).length > 0) obj.background_agent = ba;
@@ -2032,6 +2090,32 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         if (config.chatFilter.userIds && config.chatFilter.userIds.length > 0) cf.user_ids = config.chatFilter.userIds;
         if (config.chatFilter.allowedChatIds && config.chatFilter.allowedChatIds.length > 0) cf.allowed_chat_ids = config.chatFilter.allowedChatIds;
         if (Object.keys(cf).length > 0) obj.chat_filter = cf;
+    }
+
+    if (config.backfill) {
+        const b = config.backfill;
+        const backfill: Record<string, unknown> = {};
+        if (b.enabled != null) backfill.enabled = b.enabled;
+        if (b.maxMessagesPerChat != null) backfill.max_messages_per_chat = b.maxMessagesPerChat;
+        if (b.maxChats != null) backfill.max_chats = b.maxChats;
+        if (b.maxAgeMinutes != null) backfill.max_age_minutes = b.maxAgeMinutes;
+        if (b.delayMs != null) backfill.delay_ms = b.delayMs;
+        if (b.downloadMedia != null) backfill.download_media = b.downloadMedia;
+        obj.backfill = backfill;
+    }
+
+    if (config.mcpServers) {
+        obj.mcp_servers = config.mcpServers.map(server => {
+            const entry: Record<string, unknown> = { name: server.name };
+            if (server.transport != null) entry.transport = server.transport;
+            if (server.command != null) entry.command = server.command;
+            if (server.args != null) entry.args = server.args;
+            if (server.env != null) entry.env = server.env;
+            if (server.url != null) entry.url = server.url;
+            if (server.headers != null) entry.headers = server.headers;
+            if (server.autoConnect != null) entry.auto_connect = server.autoConnect;
+            return entry;
+        });
     }
 
     // emergency_block
@@ -2137,6 +2221,12 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
         if ((host === "0.0.0.0" || host === "::") && !token.trim()) {
             errors.push("dashboard.host 为 0.0.0.0 或 :: 时 token 不能为空");
         }
+    }
+
+    try {
+        parseFeishuConfig(c.feishu, true);
+    } catch (err) {
+        errors.push((err as Error).message);
     }
 
     // discord (optional)

@@ -524,8 +524,9 @@ async function executeCode(id: string, code: string, scopeId?: string): Promise<
             notifyHost(event);
         };
 
-        const { runtime, skills, telegram, discord, onebot, qqbot, wechat } = installCapabilityRegistry({
+        const { runtime, skills, telegram, discord, onebot, qqbot, wechat, feishu } = installCapabilityRegistry({
             ctx,
+            workspace: getWorkspace(),
             emitOutput: (line) => {
                 outputLines.push(line);
             },
@@ -544,6 +545,7 @@ async function executeCode(id: string, code: string, scopeId?: string): Promise<
             onebot: unknown;
             qqbot: unknown;
             wechat: unknown;
+            feishu: unknown;
         };
 
         // 用 PromiseTracker 包装注入的 API，追踪所有返回的 Promise
@@ -578,6 +580,7 @@ async function executeCode(id: string, code: string, scopeId?: string): Promise<
         const ob = onebot ? tracker.wrap(onebot as Record<string, unknown>) : undefined;
         const qb = qqbot ? tracker.wrap(qqbot as Record<string, unknown>) : undefined;
         const wx = wechat ? tracker.wrap(wechat as Record<string, unknown>) : undefined;
+        const fh = feishu ? tracker.wrap(feishu as Record<string, unknown>) : undefined;
 
         setMcpListSnapshot(await guardedCallHost("mcp.list", []) as Array<{
             name: string;
@@ -601,8 +604,8 @@ async function executeCode(id: string, code: string, scopeId?: string): Promise<
         // 构造参数列表：固定参数 + 平台 API + 动态 Skill 参数
         // ctx 保留为纯用户 state bag（LLM 可跨 turn 存取任意属性）
         const sh = installShell();
-        const fixedArgNames = ["ctx", "runtime", "scene", "skills", "fs", "mcp", "cron", "todo", "vision", "memory", "privacy", "emergency", "dispatch", "shell", "telegram", "discord", "onebot", "qq", "qqbot", "wechat"];
-        const fixedArgValues = [ctx, rt, scene, sk, filesystem, mcpBridge, tracker.wrap(cronModule as unknown as Record<string, unknown>), tracker.wrap(todoModule as unknown as Record<string, unknown>), tracker.wrap(visionModule as unknown as Record<string, unknown>), tracker.wrap(memoryModule as unknown as Record<string, unknown>), tracker.wrap(privacyModule as unknown as Record<string, unknown>), tracker.wrap(emergencyModule as unknown as Record<string, unknown>), tracker.wrap(dispatchModule as unknown as Record<string, unknown>), sh, tg, dc, ob, ob, qb, wx];
+        const fixedArgNames = ["ctx", "runtime", "scene", "skills", "fs", "mcp", "cron", "todo", "vision", "memory", "privacy", "emergency", "dispatch", "shell", "telegram", "discord", "onebot", "qq", "qqbot", "wechat", "feishu"];
+        const fixedArgValues = [ctx, rt, scene, sk, filesystem, mcpBridge, tracker.wrap(cronModule as unknown as Record<string, unknown>), tracker.wrap(todoModule as unknown as Record<string, unknown>), tracker.wrap(visionModule as unknown as Record<string, unknown>), tracker.wrap(memoryModule as unknown as Record<string, unknown>), tracker.wrap(privacyModule as unknown as Record<string, unknown>), tracker.wrap(emergencyModule as unknown as Record<string, unknown>), tracker.wrap(dispatchModule as unknown as Record<string, unknown>), sh, tg, dc, ob, ob, qb, wx, fh];
         const allArgNames = [...fixedArgNames, ...skillArgNames];
         const allArgValues = [...fixedArgValues, ...skillArgValues];
 

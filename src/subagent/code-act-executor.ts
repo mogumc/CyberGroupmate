@@ -237,10 +237,28 @@ export function getModuleRegistryCache(): ModuleEntry[] {
 const PLATFORM_MODULES: Record<string, string> = {
     telegram: "telegram",
     discord: "discord",
+    feishu: "feishu",
     onebot: "onebot",
     qqbot: "qqbot",
     wechat: "wechat",
 };
+
+export function getPlatformExecutionGuidance(platform: string): string {
+    if (platform !== "feishu") return "";
+    return [
+        "## Feishu 使用约定",
+        "只向当前任务绑定的 chatId（feishu:oc_x）发送；消息 ID 使用原始 om_x，用户 ID 使用 feishu:ou_x，不凭昵称猜 ID。",
+        'await feishu.sendText(chatId, "正文", { replyToMessageId: "om_x", replyInThread: true, mentions: [{ userId: "feishu:ou_x", displayName: "名字" }] }); 可省略 options；replyInThread 必须有 replyToMessageId。文本含提及编码后最多 20 KiB。',
+        'await feishu.sendMedia(chatId, { type: "photo", path: "media/image.png", caption: "说明" }, { replyToMessageId: "om_x" }); type 支持 photo/document/audio/video，可选 fileName 和音视频 duration；path 必须是 workspace 内本地文件，图片最多 10 MiB，其他文件最多 30 MiB。',
+        'sendMessage 支持飞书原生 text/post/interactive/share_chat/share_user；getHistory 获取当前会话历史。合并转发消息会展开为 text 和 forwardedMessages；飞书不支持下载其中子消息的媒体资源，因此不会暴露这些附件的下载引用。',
+        '收到 sticker 时可用 mediaInfo.sendableFileId（或 fileId）调用 sendSticker；飞书不允许机器人上传任意新表情包。sendTemplateCard/updateTemplateCard 使用卡片模板；sendCard/updateCard/patchCard/streamCardText 使用 CardKit，动态更新需对同一 messageId 使用递增 sequence。',
+        'card.action.trigger 和消息表情增删会作为普通 nc.message 输入，原始 action/context 或 emoji 位于 payload.platformData；可按 replyToMessageId 找到被操作的消息。callApi(chatId, action, { path, params, data }) 开放消息编辑/撤回/转发/已读查询、表情、Pin、群资料、成员、管理员和群菜单，参数保持飞书 SDK 形状。',
+        "caption 是单独的回复消息，不是媒体正文。主回执只确认媒体成功；只有 additionalMessages 中的成功 messageId 才确认说明文字已发出。captionError 表示媒体成功、说明失败，不要为重发说明而重发媒体。null 表示被拦截，不能说已发送。",
+        "回执 senderUserId、mentions、replyToMessageId、rootId、threadId 是实际发送上下文；自己的发言不等于他人或 bot 回应。完成任务前区分已发送、部分失败、对方是否回应，不虚构成功或已读。",
+        "feishu.getMessage(chatId, messageId) / getChat(chatId) 查询消息和会话；downloadMedia(fileId, chatId?, messageId?, uniqueFileId?) 返回 Downloads 内路径，可交给 vision.see(path)。",
+        "Feishu 不提供机器人 typing，也不允许机器人把收到的消息标为已读；但 message.readUsers 可以查询机器人自己 7 天内发送消息的已读用户。不要虚构输入状态或已读。发送未提供 uuid 时系统每次操作生成一个，不自动重试。",
+    ].join("\n");
+}
 
 /**
  * 加载 API 轻量概览，按平台过滤，注入到执行 prompt 的 {{apiTypeDefs}} 占位符。
@@ -311,7 +329,9 @@ function normalizeThinkingText(thinking: string | undefined): string {
 function formatThinkingTranscript(result: SessionResult): string {
     const parts = result.turns
         .map((turn, index) => {
-            const thinking = normalizeThinkingText(turn.thinking);
+            const thinking = turn.formatError
+                ? `[格式错误，未执行] ${turn.formatError}`
+                : normalizeThinkingText(turn.thinking);
             if (!thinking) return null;
             return `[Turn ${index + 1}]\n${thinking}`;
         })
@@ -413,11 +433,12 @@ function formatExecutionRecordForCompact(rec: SessionExecutionRecord): string | 
  * session endReason → 派发任务终态映射：
  *   - error       → ERROR
  *   - interrupted → SKIPPED（被新消息/用户打断，是主动让路，非失败，不应误记 COMPLETED）
- *   - 其余（end_turn / max_turns）→ COMPLETED
+ *   - max_turns   → ERROR（轮次耗尽不能作为任务完成）
+ *   - end_turn    → COMPLETED
  * 注意：TIMEOUT 不在此产生——它只由 GlobalState 启动对账（进程中途退出残留 RUNNING）补写。
  */
 export function endReasonToTaskStatus(endReason: string | undefined): SubagentCallback["status"] {
-    return endReason === "error" ? "ERROR"
+    return endReason === "error" || endReason === "max_turns" ? "ERROR"
         : endReason === "interrupted" ? "SKIPPED"
             : "COMPLETED";
 }
@@ -813,7 +834,7 @@ export class CodeActExecutor {
                     : `- ${item.key}: ${item.content}`
             ).join("\n"),
         };
-        const systemPrompt = renderPrompt("EXECUTION", systemVars);
+        const systemPrompt = [renderPrompt("EXECUTION", systemVars), getPlatformExecutionGuidance(platform)].filter(Boolean).join("\n\n");
 
         let taskPrompt = task.continuationPrompt ?? "";
         let imageParts: ChatMessage["imageParts"] = [];
@@ -1040,12 +1061,14 @@ export class CodeActExecutor {
 
         // 记录 execution record（用于 compact）
         const thinkingSummary = sessionResult.turns
-            .map(t => normalizeThinkingText(t.thinking))
+            .map(t => t.formatError ? `[格式错误，未执行] ${t.formatError}` : normalizeThinkingText(t.thinking))
             .filter(Boolean)
             .join(" | ")
             .slice(0, 500);
 
         const thinkingTranscript = formatThinkingTranscript(sessionResult);
+        const executedCodeBlocks = sessionResult.turns.reduce((count, turn) => count + turn.executionResults.length, 0);
+        const outcomeSummary = `执行事实：endReason=${sessionResult.endReason}, turns=${sessionResult.turns.length}, executedCodeBlocks=${executedCodeBlocks}, sentMessages=${sentCollector.allSent.length}。思考文本不是执行或发送回执。`;
 
         this.executionRecords.push({
             taskId: task.taskId,
@@ -1066,14 +1089,15 @@ export class CodeActExecutor {
             isDirectMessage: ctx.isDirectMessage,
             executionType: "CODEACT",
             status,
-            summary: thinkingTranscript,
+            endReason: sessionResult.endReason,
+            turns: sessionResult.turns.length,
+            executedCodeBlocks,
+            summary: `${outcomeSummary}\n${thinkingTranscript}`,
             replyContent: sessionResult.turns
                 .filter((t: any) => t.role === "assistant" && t.content)
                 .map((t: any) => t.content)
                 .join("\n") || undefined,
-            sentMessages: sentCollector.allSent.length > 0
-                ? sentCollector.allSent.map(m => ({ messageId: m.messageId, text: m.text, timestamp: m.timestamp }))
-                : undefined,
+            sentMessages: sentCollector.allSent.map(m => ({ messageId: m.messageId, text: m.text, timestamp: m.timestamp })),
             tokensUsed: (sessionResult as any).tokensUsed ?? undefined,
             error: sessionResult.error,
             durationMs,
@@ -1084,6 +1108,9 @@ export class CodeActExecutor {
         this.globalState?.updateDispatchedSubagentTask(task.taskId, {
             status: callback.status,
             sessionId: sessionResult.sessionId,
+            endReason: callback.endReason,
+            turns: callback.turns,
+            executedCodeBlocks: callback.executedCodeBlocks,
             summary: callback.summary,
             sentMessages: callback.sentMessages,
             error: callback.error,

@@ -46,7 +46,9 @@ import { DiscordAdapter } from "./adapter/discord-adapter.js";
 import { OneBotAdapter } from "./adapter/onebot-adapter.js";
 import { QQBotOfficialAdapter } from "./adapter/qqbot-official-adapter.js";
 import { WeChatAdapter } from "./adapter/wechat-adapter.js";
+import { FeishuAdapter } from "./adapter/feishu-adapter.js";
 import type { PlatformAdapter } from "./adapter/platform-adapter.js";
+import { createTypingSender } from "./adapter/typing.js";
 import { BackfillCoordinator, resolveBackfillConfig, BACKFILL_FLAG, BACKFILL_STALE_FLAG, BACKFILL_DIRECT_REASON } from "./adapter/backfill.js";
 import { markChatAsRead } from "./adapter/read-receipts.js";
 
@@ -508,18 +510,14 @@ async function main(): Promise<void> {
         adapters.push(wechatAdapter);
     }
 
-    if (adapters.length === 0) {
-        throw new Error("至少需要配置一个平台 adapter（telegram / discord / onebot / qqbot / wechat）");
+    if (appConfig.feishu) {
+        adapters.push(new FeishuAdapter(appConfig.feishu, nc, resolve(DATA_DIR), {
+            hasMessage: (chatId, messageId) => memory.getMessageById(chatId, messageId) !== null,
+        }));
     }
 
-    // 通用路由函数
-    function getAdapterForChat(chatId: string): PlatformAdapter | undefined {
-        try {
-            const platform = getPlatform(chatId);
-            return adapters.find(a => a.platform === platform);
-        } catch {
-            return undefined;
-        }
+    if (adapters.length === 0) {
+        throw new Error("至少需要配置一个平台 adapter（telegram / discord / onebot / qqbot / wechat / feishu）");
     }
 
     function markDirectSubagentDeliveryAsRead(chatId: string, reason: string): void {
@@ -1103,15 +1101,6 @@ async function main(): Promise<void> {
 
 
 
-    const sendTyping = async (chatId: string) => {
-        const adapter = getAdapterForChat(chatId);
-        if (!adapter) {
-            return;
-        }
-        const typingMethod = `${adapter.platform}.sendTyping`;
-        await adapter.handleCall(typingMethod, [chatId]);
-    };
-
     const buildDownloadFn = (chatId: string) => {
         const adapter = adapters.find((item) => chatId.startsWith(item.platform + ":"));
         if (!adapter) {
@@ -1169,7 +1158,7 @@ async function main(): Promise<void> {
             memory,
             visionConfig,
             buildDownloadFn(chatId),
-            sendTyping,
+            createTypingSender(chatAdapter),
             visionLlmConfig,
             sharedMediaDownloader,
             formatMention,
@@ -1421,8 +1410,15 @@ async function main(): Promise<void> {
                 listTasks: () => globalState.listDispatchedSubagentTasks({ limit: 200 }).tasks,
                 memory,
                 sinceTs,
-                sessionDigests: memory.listSessionDigests({ limit: 30 }).slice().reverse(),
+                // digest 与任务共用同一个周期窗口：上次做梦时已消化的播报不再重复进入本次上下文
+                sessionDigests: memory.listSessionDigests({
+                    limit: 30,
+                    ...(sinceTs != null ? { after: new Date(sinceTs).toISOString() } : {}),
+                }).slice().reverse(),
             }),
+            idleMinIntervalMs: appConfig.backgroundAgent!.idleMinIntervalHours != null
+                ? appConfig.backgroundAgent!.idleMinIntervalHours * 60 * 60_000
+                : undefined,
         });
         harnessManager.onSpawnFailure = (error, pendingCount) => {
             globalState.addSessionDigest(`[Background Agent spawn failed] ${error} (${pendingCount} pending tasks)`, {
@@ -1435,7 +1431,7 @@ async function main(): Promise<void> {
             });
         };
         mainLoop.setProactiveIdleHandler((payload) => {
-            harnessManager!.enqueue({
+            harnessManager!.triggerIdle({
                 content: `consciousness_tick: ${payload.description}`,
                 source: "proactive-idle",
                 actorId: "main-loop",
