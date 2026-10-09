@@ -509,6 +509,18 @@ export interface ChatFilterConfig {
 }
 
 /**
+ * 原始消息保留策略（定期清理 message_log）。
+ *
+ * 原始对话是缓存，沉淀后的记忆（话题 / facts / 画像 / session_digests）不受影响。
+ */
+export interface RetentionConfig {
+    /** 保留天数。默认 7；设 0 关闭（永久保存）。 */
+    messageLogDays?: number;
+    /** 扫描间隔（小时）。默认 6。 */
+    sweepIntervalHours?: number;
+}
+
+/**
  * 离线补抓配置：重启 / 掉线重连后补载错过的消息。
  *
  * 补抓的消息只落盘 + 参与话题聚类，不会逐条唤醒 agent；
@@ -678,6 +690,8 @@ export interface AppConfig {
     metrics?: MetricsConfig;
     /** 聊天过滤（按 chatId 黑/白名单过滤入站消息） */
     chatFilter?: ChatFilterConfig;
+    /** 原始消息保留策略（定期清理 message_log） */
+    retention?: RetentionConfig;
     /** 离线补抓（重启/重连后补载错过的消息） */
     backfill?: BackfillConfig;
     /** 紧急拉黑预设文案（emergency.block） */
@@ -911,6 +925,7 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
         envVars: parseEnvVars(fileConfig),
         metrics: parseMetricsConfig(fileConfig),
         chatFilter: parseChatFilterConfig(fileConfig),
+        retention: parseRetentionConfig(fileConfig),
         backfill: parseBackfillConfig(fileConfig),
         emergencyBlock: parseEmergencyBlockConfig(fileConfig),
         mcpServers: parseMcpServersConfig(fileConfig),
@@ -1056,6 +1071,22 @@ function parseChatFilterConfig(fileConfig: Record<string, unknown>): ChatFilterC
     }
 
     return migrateLegacyWhitelists(fileConfig);
+}
+
+function parseRetentionConfig(fileConfig: Record<string, unknown>): RetentionConfig | undefined {
+    const raw = (fileConfig.retention ?? fileConfig.messageRetention) as Record<string, unknown> | undefined;
+    if (!raw || typeof raw !== "object") return undefined;
+
+    const daysRaw = raw.message_log_days ?? raw.messageLogDays;
+    const hoursRaw = raw.sweep_interval_hours ?? raw.sweepIntervalHours;
+    const parsed: RetentionConfig = {};
+    if (typeof daysRaw === "number" && Number.isFinite(daysRaw) && daysRaw >= 0) {
+        parsed.messageLogDays = Math.floor(daysRaw);
+    }
+    if (typeof hoursRaw === "number" && Number.isFinite(hoursRaw) && hoursRaw > 0) {
+        parsed.sweepIntervalHours = hoursRaw;
+    }
+    return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
 function stringList(value: unknown): string[] | undefined {
@@ -2119,6 +2150,13 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
     }
 
     // emergency_block
+    if (config.retention) {
+        const retention: Record<string, unknown> = {};
+        if (config.retention.messageLogDays != null) retention.message_log_days = config.retention.messageLogDays;
+        if (config.retention.sweepIntervalHours != null) retention.sweep_interval_hours = config.retention.sweepIntervalHours;
+        if (Object.keys(retention).length > 0) obj.retention = retention;
+    }
+
     if (config.emergencyBlock && config.emergencyBlock.message != null) {
         obj.emergency_block = { message: config.emergencyBlock.message };
     }
@@ -2307,6 +2345,19 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
         const gPool = grounding.pool as PoolConfig | undefined;
         if (gPool && (!gPool.members || gPool.members.length === 0)) {
             errors.push("grounding.pool.keys 不能为空");
+        }
+    }
+
+    // retention（原始消息保留策略）
+    const retention = c.retention as Record<string, unknown> | undefined;
+    if (retention && typeof retention === "object") {
+        const days = retention.messageLogDays ?? retention.message_log_days;
+        if (days != null && (typeof days !== "number" || !Number.isFinite(days) || days < 0)) {
+            errors.push("retention.message_log_days 必须是非负数字（0 表示永久保存）");
+        }
+        const hours = retention.sweepIntervalHours ?? retention.sweep_interval_hours;
+        if (hours != null && (typeof hours !== "number" || !Number.isFinite(hours) || hours <= 0)) {
+            errors.push("retention.sweep_interval_hours 必须是正数");
         }
     }
 

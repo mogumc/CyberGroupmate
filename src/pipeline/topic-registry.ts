@@ -363,6 +363,36 @@ export class TopicRegistry extends EventEmitter {
     }
 
     /**
+     * 按会话清空内存话题（会话级删除用）。
+     *
+     * 注意：这里只清内存 registry。DB `topics` 表必须另外删
+     * （`MemoryStoreV2.deleteTopicsByChat`），否则面板会把 DB 历史话题再合并回来。
+     */
+    purgeChat(chatId: string): number {
+        let removed = 0;
+        for (const [id, topic] of this.topics) {
+            if (topic.chatId === chatId) {
+                this.topics.delete(id);
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            log.info("purgeChat: 已清空会话话题", { chatId, removed, remaining: this.topics.size });
+        }
+        return removed;
+    }
+
+    /** 删除单个内存话题；传 chatId 时校验归属，避免误删别的会话。 */
+    removeTopic(topicId: string, chatId?: string): boolean {
+        const topic = this.topics.get(topicId);
+        if (!topic) return false;
+        if (chatId !== undefined && topic.chatId !== chatId) return false;
+        this.topics.delete(topicId);
+        log.info("removeTopic", { topicId, chatId: topic.chatId });
+        return true;
+    }
+
+    /**
      * 是否有其他 ENGAGED 话题（某群内）
      * 用于消息归属判定时的回退
      */

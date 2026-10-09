@@ -36,6 +36,11 @@ import {
 import { getMetaHistoryWindowStatus } from "../main-agent/meta-history-retention.js";
 import { getPlatform } from "../core/chat-id.js";
 import { releaseChatFromFilter, shouldDropInbound } from "../core/inbound-filter.js";
+import {
+    ConversationManager,
+    ConversationDeleteError,
+    DELETE_REASON_PRESETS,
+} from "../core/conversation-manager.js";
 import { resolveBackfillConfig } from "../adapter/backfill.js";
 import { extractAnimatedStickerFrames } from "../core/vision-processor.js";
 import { CACHE_CATEGORY_KEYS, type CacheCategoryKey } from "../core/media-downloader.js";
@@ -449,6 +454,13 @@ function requiredString(value: unknown, fieldName: string): string {
 
 export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Router {
     const router = Router();
+
+    // 会话管理（移除不需要的对话）：级联清理的单一入口
+    const conversationManager = new ConversationManager({
+        memory: deps.memory,
+        subagentManager: deps.subagentManager,
+        accumulator: deps.accumulator,
+    });
 
     // ─── Overview ───
     router.get("/overview", (_req, res) => {
@@ -1790,6 +1802,40 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
     router.delete("/memory/interaction/:id", (req, res) => {
         const ok = deps.memory.deleteInteraction(req.params.id);
         res.json({ ok });
+    });
+
+    // ─── 会话管理：移除不需要的对话 ───
+    // 列表 = 运行时实例 ∪ message_log 出现过 ∪ 群组画像，保证"看得到的都能删"。
+    router.get("/conversation-management", (_req, res) => {
+        try {
+            res.json({
+                presets: DELETE_REASON_PRESETS,
+                conversations: conversationManager.listConversations(),
+                audit: conversationManager.listAudit(50),
+            });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    // 级联删除一个会话（不可逆）。理由必填 —— 见 conversation-manager.ts 的级联顺序。
+    // 记忆（core_facts / person_* / interactions / session_digests）不受影响。
+    router.delete("/memory/chat/:chatId", async (req, res) => {
+        try {
+            const { reasonCode, reasonText, chatTitle } = (req.body ?? {}) as {
+                reasonCode?: string;
+                reasonText?: string;
+                chatTitle?: string;
+            };
+            const record = await conversationManager.delete(req.params.chatId, { reasonCode: reasonCode ?? "", reasonText, chatTitle });
+            res.json({ ok: true, record });
+        } catch (err) {
+            if (err instanceof ConversationDeleteError) {
+                res.status(400).json({ ok: false, error: err.message, code: err.code });
+                return;
+            }
+            res.status(500).json({ ok: false, error: String(err) });
+        }
     });
 
     // ─── LLM Logs (paginated + export) ───

@@ -3650,6 +3650,84 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         return result.changes;
     }
 
+    // ─── 会话级清理（Dashboard 会话管理用） ───
+
+    /**
+     * 删除某会话下的全部话题。
+     *
+     * 必须同时清三张表：`topics` 主表、`topics_fts`（独立 FTS5，按 rowid 关联）、
+     * `topics_vec`（vec0 虚拟表，按 topic_id 关联）。只删主表会留下"幽灵"检索命中。
+     */
+    deleteTopicsByChat(chatId: string): number {
+        const rows = this.db.prepare("SELECT rowid, id FROM topics WHERE chat_id = ?")
+            .all(chatId) as Array<{ rowid: number; id: string }>;
+        if (rows.length === 0) return 0;
+
+        const delFts = this.db.prepare("DELETE FROM topics_fts WHERE rowid = ?");
+        const delVec = this.sqliteVecAvailable
+            ? this.db.prepare("DELETE FROM topics_vec WHERE topic_id = ?")
+            : null;
+        const delTopics = this.db.prepare("DELETE FROM topics WHERE chat_id = ?");
+
+        const run = this.db.transaction(() => {
+            for (const row of rows) {
+                try { delFts.run(row.rowid); } catch { /* FTS 索引与主表不同步时忽略 */ }
+                if (delVec) {
+                    try { delVec.run(row.id); } catch { /* vec0 索引缺失时忽略 */ }
+                }
+            }
+            return delTopics.run(chatId).changes;
+        });
+
+        const deleted = run();
+        log.info("deleteTopicsByChat", { chatId, deleted, indexed: rows.length });
+        return deleted;
+    }
+
+    /** 删除某会话的群组画像行（key 由调用方按 getGroupModelKey 归一）。 */
+    deleteGroupModel(chatId: string): boolean {
+        const result = this.db.prepare("DELETE FROM group_models WHERE chat_id = ?").run(chatId);
+        log.info("deleteGroupModel", { chatId, deleted: result.changes > 0 });
+        return result.changes > 0;
+    }
+
+    /** 删除某会话的全部原始消息。 */
+    deleteMessagesByChat(chatId: string): number {
+        const result = this.db.prepare("DELETE FROM message_log WHERE chat_id = ?").run(chatId);
+        log.info("deleteMessagesByChat", { chatId, deleted: result.changes });
+        return result.changes;
+    }
+
+    /**
+     * 按时间清理原始消息（定期保留任务用）。
+     *
+     * 只删 message_log：话题 / core_facts / 画像 / session_digests 是沉淀后的长期资产，不动。
+     * 副作用（已知且可接受）：
+     * - 依赖 message_log 的 topic 归因回查、reply chain 会拿不到更早的消息；
+     * - 补抓水位 getBackfillWatermark 会随之下移，靠 maxAgeMinutes 上限兜住。
+     */
+    pruneMessagesBefore(cutoffIso: string): number {
+        const result = this.db.prepare("DELETE FROM message_log WHERE timestamp < ?").run(cutoffIso);
+        if (result.changes > 0) {
+            log.info("pruneMessagesBefore", { cutoffIso, deleted: result.changes });
+        }
+        return result.changes;
+    }
+
+    /** 统计某会话的原始消息条数（会话管理列表用）。 */
+    countMessagesByChat(chatId: string): number {
+        const row = this.db.prepare("SELECT COUNT(*) AS cnt FROM message_log WHERE chat_id = ?")
+            .get(chatId) as { cnt?: number } | undefined;
+        return Number(row?.cnt ?? 0);
+    }
+
+    /** 统计某会话的话题条数（含已归档；会话管理列表用）。 */
+    countTopicsByChat(chatId: string): number {
+        const row = this.db.prepare("SELECT COUNT(*) AS cnt FROM topics WHERE chat_id = ?")
+            .get(chatId) as { cnt?: number } | undefined;
+        return Number(row?.cnt ?? 0);
+    }
+
     /** 更新 message_log 中单条消息的文本 */
     updateMessage(chatId: string, messageId: string, data: { text?: string; displayName?: string }): boolean {
         const builder = new SafeUpdateBuilder("message_log");

@@ -24,6 +24,7 @@
   import SystemPanel from './panels/SystemPanel.svelte';
   import ConfigPanel from './panels/ConfigPanel.svelte';
   import BackgroundAgentPanel from './panels/BackgroundAgentPanel.svelte';
+  import ConversationManagementPanel from './panels/ConversationManagementPanel.svelte';
   import TopicDetailPanel from './panels/TopicDetailPanel.svelte';
   import EnqueueModal from './panels/EnqueueModal.svelte';
   import MemoryEditModal from './panels/MemoryEditModal.svelte';
@@ -79,6 +80,7 @@
     <div class:hidden={$activeTab !== 'scheduler'}><SchedulerPanel /></div>
     <div class:hidden={$activeTab !== 'system'}><SystemPanel /></div>
     <div class:hidden={$activeTab !== 'background-agent'}><BackgroundAgentPanel /></div>
+    <div class:hidden={$activeTab !== 'conversation-management'}><ConversationManagementPanel /></div>
     <div class:hidden={$activeTab !== 'config'}><ConfigPanel /></div>
     <div class:hidden={$activeTab !== 'topic-detail'}><TopicDetailPanel /></div>
 

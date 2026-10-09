@@ -14,6 +14,7 @@ import { NotificationCenter, type NotificationEvent } from "./event/notification
 import { ensureCompositeId, getRawId, getPlatform, getGroupModelKey } from "./core/chat-id.js";
 import { userGate } from "./adapter/user-gate.js";
 import { shouldDropInbound } from "./core/inbound-filter.js";
+import { startMessageRetention } from "./core/message-retention.js";
 import { SandboxPool } from "./sandbox/sandbox-pool.js";
 import type { ShellWakeEvent } from "./sandbox/sandbox.js";
 import { installSkillsDependencies } from "./sandbox/skill-loader.js";
@@ -985,6 +986,10 @@ async function main(): Promise<void> {
     }, 60_000);
     if (topicCleanupInterval.unref) topicCleanupInterval.unref();
 
+    // 原始消息定期保留：默认只留最近 7 天（config.retention.message_log_days，0 = 永久保存）。
+    // 只清 message_log；话题 / 记忆 / session digest 不受影响。
+    const stopMessageRetention = startMessageRetention({ memory });
+
     // Subagent 实例是 chat-bound 的，不做空闲回收。
     // Sandbox 空闲回收由 SandboxPool 独立管理。
 
@@ -1751,6 +1756,7 @@ async function main(): Promise<void> {
         clearInterval(topicCleanupInterval);
         clearInterval(reflectionInterval);
         clearInterval(schedulerWatchdogInterval);
+        stopMessageRetention();
         for (const timer of backfillTimers) clearTimeout(timer);
         backfillCoordinator?.dispose();
         if (backgroundDreamingInterval) clearInterval(backgroundDreamingInterval);

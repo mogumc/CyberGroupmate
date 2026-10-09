@@ -243,6 +243,14 @@ backfill:
 #   # blacklist 通配规则下的单会话放行例外（通常由 Dashboard 自动维护）
 #   allowed_chat_ids: []
 
+# ─── 原始消息保留策略 ───
+# 原始对话是缓存，沉淀后的记忆（话题 / 核心事实 / 画像 / session digest）不受影响。
+# 定期清理 message_log 中超过 message_log_days 的原始消息；心跳间隔见 sweep_interval_hours。
+# 注意：清理后依赖 message_log 的"话题归因回查 / 回复链"会拿不到更早的消息（摘要仍在 topics 表）。
+# retention:
+#   message_log_days: 7        # 保留天数；设 0 关闭（永久保存）
+#   sweep_interval_hours: 6    # 扫描间隔（小时）
+
 # ─── Telegram 设置 ───
 # 可选。telegram / discord / feishu 至少配置一个。
 telegram:
