@@ -3,15 +3,20 @@
  *
  * 「移除不需要的对话」的执行者：按固定顺序级联清理一个会话在各处的痕迹。
  *
- * 级联顺序（缺一不可，见 docs/conversation-hygiene-plan.md §6）：
- *   1. 内存话题（TopicRegistry）→ 2. 销毁运行时实例（Subagent）
- *   → 3. DB 话题（topics + topics_fts + topics_vec）
- *   → 4. 原始消息（message_log）→ 5. attention / signal pool
- *   → 6. session 文件 → 7. 群组画像（group_models）→ 8. 写审计
+ * 级联顺序（缺一不可）：
+ *   1. 取消在途 CodeAct → 2. 内存话题（TopicRegistry）→ 3. 销毁运行时实例（Subagent）
+ *   → 4. DB 话题（topics + topics_fts + topics_vec）
+ *   → 5. 原始消息（message_log）→ 6. attention / signal pool
+ *   → 7. session 文件 → 8. 群组画像（group_models）→ 9. 写审计
  *
  * **明确不动**：core_facts / person_identities / person_profiles /
  * person_group_profiles / interactions / session_digests —— 这些是沉淀后的长期记忆，
  * 会话删除不牵连（用户想删可走记忆面板各自的删除入口）。
+ *
+ * 审计（`workspace/conversation-deletions.json`）默认只保留最近
+ * `DEFAULT_AUDIT_DAYS` 天：过期记录在读取时被过滤、在下次写入时物理丢弃；
+ * 另提供 `purgeAudit()` 支持单条 / 按时间 / 全量清空（清空后不留痕）。
+ * 保留天数与条数上限走 `config.retention.audit_days` / `audit_limit`。
  *
  * 设计约束：依赖以窄接口注入（与 meta-api/conversations.ts 同一风格），
  * 便于单测与避免与上游改动正面相撞。
@@ -19,8 +24,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { createLogger } from "./logger.js";
 import { safeGroupModelKey } from "./chat-id.js";
+import type { RetentionConfig } from "./config.js";
 
 const log = createLogger("conversation-manager");
 
@@ -50,12 +57,96 @@ export const DELETE_REASON_PRESETS: readonly DeleteReasonPreset[] = [
 
 const REASON_CODES = new Set<string>(DELETE_REASON_PRESETS.map((p) => p.code));
 
-/** 删除被拒（理由缺失/非法、会话不存在等）。 */
+// ─── 审计保留策略 ───
+
+/**
+ * 审计默认保留天数。与 message_log 的 7 天不同 —— 审计是"谁在什么时候删了什么"的
+ * 唯一凭据，删了就再也查不回来，所以给到两周；0 表示永久保留。
+ */
+export const DEFAULT_AUDIT_DAYS = 14;
+/** 审计默认条数上限（防止单日批量删除把文件撑爆）。0 表示不限。 */
+export const DEFAULT_AUDIT_LIMIT = 200;
+
+/** 解析后的审计保留策略。 */
+export interface ResolvedAuditRetention {
+    auditDays: number;
+    auditLimit: number;
+}
+
+/**
+ * 解析审计保留配置：缺省 14 天 / 200 条；非法值回退默认。
+ * 与 message-retention 的 `resolveMessageRetention` 同风格（天数允许 0 = 关闭清理）。
+ */
+export function resolveAuditRetention(config?: RetentionConfig): ResolvedAuditRetention {
+    return {
+        auditDays: normalizeNonNegative(config?.auditDays, DEFAULT_AUDIT_DAYS),
+        auditLimit: normalizeNonNegative(config?.auditLimit, DEFAULT_AUDIT_LIMIT),
+    };
+}
+
+/** 天数允许 0（表示不清理），所以只要求非负。 */
+function normalizeNonNegative(value: unknown, fallback: number): number {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
+/** 计算审计的 cut-off（ISO）。days<=0 返回 null，表示不按时间清理。 */
+export function resolveAuditCutoffIso(days: number, nowMs: number = Date.now()): string | null {
+    if (!Number.isFinite(days) || days <= 0) return null;
+    return new Date(nowMs - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/** 审计默认扫描间隔（小时）—— 过期记录多久被物理清一次。 */
+export const DEFAULT_AUDIT_SWEEP_HOURS = 6;
+
+/**
+ * 启动审计定期清理，返回停止函数。
+ *
+ * `readAudit` 只在读取时过滤过期记录，磁盘上的旧数据要等下次写入才消失；
+ * 没有新删除发生时就会一直留着。本定时器负责把过期记录真正清掉。
+ *
+ * 定时器**始终创建**，是否清理交给 `sweepAudit()` 每次读配置决定 ——
+ * 这样 Dashboard 把 `audit_days` 从 0 改成 14（或反向）无需重启即可生效。
+ *
+ * 定时器写法对齐 main.ts 既有的 topicCleanupInterval / startMessageRetention。
+ */
+export function startAuditRetention(manager: { sweepAudit(): number }): () => void {
+    const timer = setInterval(() => {
+        try {
+            manager.sweepAudit();
+        } catch (err) {
+            log.warn("审计定期清理失败", { error: String(err) });
+        }
+    }, DEFAULT_AUDIT_SWEEP_HOURS * 60 * 60 * 1000);
+    if (typeof timer.unref === "function") timer.unref();
+    log.info("审计定期清理已启动", { intervalHours: DEFAULT_AUDIT_SWEEP_HOURS });
+    return () => clearInterval(timer);
+}
+
+/** 删除被拒（理由缺失/非法、会话不存在、审计清理参数非法等）。 */
 export class ConversationDeleteError extends Error {
-    constructor(message: string, readonly code: "reason_required" | "invalid_reason" | "not_found" = "reason_required") {
+    constructor(
+        message: string,
+        readonly code: "reason_required" | "invalid_reason" | "not_found" | "invalid_before" = "reason_required",
+    ) {
         super(message);
         this.name = "ConversationDeleteError";
     }
+}
+
+/**
+ * 校验并归一化审计清理的 `before`。
+ *
+ * 必须归一化：`deletedAt` 一律是 `toISOString()` 的输出，而 `before` 来自外部
+ * （HTTP query / 直接调用），格式不保证一致。直接做字符串比较时
+ * `"2026-01-01T00:00:00.000Z" < "garbage"` 恒为真 —— 「按时间清理」会被静默变成「全清」。
+ * 非法值必须抛错而不是返回 0：静默 no-op 会让人以为清过了（这正是上一轮修掉的错误类型）。
+ */
+function normalizeAuditBefore(before: string): string {
+    const ms = Date.parse(before);
+    if (!Number.isFinite(ms)) {
+        throw new ConversationDeleteError(`before 不是合法时间：${before}`, "invalid_before");
+    }
+    return new Date(ms).toISOString();
 }
 
 export function describeDeleteReason(code: DeleteReasonCode, text?: string): string {
@@ -104,13 +195,21 @@ export interface ConversationManagerOptions {
     accumulator: { remove(chatId: string): void };
     /** 审计文件路径，默认 workspace/conversation-deletions.json */
     auditPath?: string;
-    /** 审计保留条数，默认 200 */
-    auditLimit?: number;
+    /**
+     * 审计保留策略。支持传 getter（`() => loadConfig().retention`）以在
+     * Dashboard 保存配置后热生效 —— 与 grounding 的 `GroundingConfigSource` 同思路。
+     * 缺省用 DEFAULT_AUDIT_DAYS（14）/ DEFAULT_AUDIT_LIMIT（200）。
+     */
+    auditRetention?: RetentionConfig | (() => RetentionConfig | undefined);
+    /** 覆盖"现在"（测试用） */
+    now?: () => number;
 }
 
 // ─── 记录 ───
 
 export interface ConversationDeletionRecord {
+    /** 稳定标识（purgeAudit 按它做单条删除）。旧记录可能没有，读取时用 chatId+deletedAt 兜底。 */
+    id?: string;
     chatId: string;
     chatTitle?: string;
     reasonCode: DeleteReasonCode;
@@ -147,6 +246,14 @@ export interface ConversationSummary {
     active: boolean;
 }
 
+/** 审计清理条件。全部缺省 = 全清。 */
+export interface AuditPurgeFilter {
+    /** 只删 `deletedAt < before` 的记录（ISO，严格小于） */
+    before?: string;
+    /** 只删这一条（recordKey 的结果：id，或旧记录的 chatId@deletedAt） */
+    id?: string;
+}
+
 // ─── 实现 ───
 
 export class ConversationManager {
@@ -154,14 +261,24 @@ export class ConversationManager {
     private readonly runtime: ConversationRuntime;
     private readonly accumulator: { remove(chatId: string): void };
     private readonly auditPath: string;
-    private readonly auditLimit: number;
+    private readonly auditRetentionSource: RetentionConfig | (() => RetentionConfig | undefined) | undefined;
+    private readonly now: () => number;
 
     constructor(options: ConversationManagerOptions) {
         this.memory = options.memory;
         this.runtime = options.subagentManager;
         this.accumulator = options.accumulator;
         this.auditPath = options.auditPath ?? path.join("workspace", "conversation-deletions.json");
-        this.auditLimit = options.auditLimit ?? 200;
+        this.auditRetentionSource = options.auditRetention;
+        this.now = options.now ?? Date.now;
+    }
+
+    /** 每次读写审计时重新解析，使 Dashboard 保存的保留策略能热生效。 */
+    private auditPolicy(): ResolvedAuditRetention {
+        const source = typeof this.auditRetentionSource === "function"
+            ? this.auditRetentionSource()
+            : this.auditRetentionSource;
+        return resolveAuditRetention(source);
     }
 
     /**
@@ -261,12 +378,13 @@ export class ConversationManager {
         const groupModel = step("deleteGroupModel", () => this.memory.deleteGroupModel(safeGroupModelKey(id)), false);
 
         const record: ConversationDeletionRecord = {
+            id: randomUUID(),
             chatId: id,
             chatTitle: input?.chatTitle?.trim() || undefined,
             reasonCode: code,
             reasonText,
             reason: describeDeleteReason(code, reasonText),
-            deletedAt: new Date().toISOString(),
+            deletedAt: new Date(this.now()).toISOString(),
             deleted: { memoryTopics, topics, messages, runtimeInstance, sessionFile, groupModel },
             ...(failures.length > 0 ? { failures } : {}),
         };
@@ -276,9 +394,88 @@ export class ConversationManager {
         return record;
     }
 
-    /** 读取审计记录（最新在前）。 */
+    /**
+     * 读取审计记录（最新在前）。已按 `auditDays` 过滤掉过期记录 ——
+     * 过期记录在下次 `appendAudit` / `sweepAudit` / `purgeAudit` 时会被物理丢弃。
+     */
     listAudit(limit = 50): ConversationDeletionRecord[] {
         return this.readAudit().slice(0, Math.max(1, limit));
+    }
+
+    /** 审计记录总数（已按保留期过滤，与 listAudit 同源）。 */
+    countAudit(): number {
+        return this.readAudit().length;
+    }
+
+    /**
+     * 物理丢弃过期审计记录。`readAudit` 只是过滤，文件里的过期记录要等下一次
+     * 写入才消失；没有新删除发生时就会一直躺在磁盘上。定时调用本方法补上这一步。
+     *
+     * 返回删除条数。`auditDays <= 0`（永久保留）时不动作。
+     */
+    sweepAudit(): number {
+        const { auditDays } = this.auditPolicy();
+        const cutoff = resolveAuditCutoffIso(auditDays, this.now());
+        if (!cutoff) return 0;
+
+        const raw = this.readAuditRaw();
+        const keep = raw.filter((rec) => !rec.deletedAt || rec.deletedAt >= cutoff);
+        const removed = raw.length - keep.length;
+        if (removed === 0) return 0;
+        try {
+            this.writeAudit(keep);
+        } catch (err) {
+            log.warn("审计清理失败", { auditPath: this.auditPath, error: String(err) });
+            return 0;
+        }
+        log.info("已清理过期审计记录", { removed, remaining: keep.length, keepDays: auditDays });
+        return removed;
+    }
+
+    /**
+     * 清空审计。
+     *
+     * - 无 filter：全清（物理删除整个文件，readAudit 对不存在的文件返回空）。
+     * - `before`：删除 `deletedAt < before` 的记录（**严格小于**，与
+     *   `message-retention` 的 cutoff 语义一致 —— 恰好等于的记录保留）。
+     * - `id`：只删一条。
+     *
+     * 返回实际删除条数。全清不留任何痕迹（不做"清空本身也记一笔"的反向审计）。
+     *
+     * ⚠️ 操作对象是**磁盘上的全部记录**（`readAuditRaw`），不是 `listAudit` 那份
+     * 已按保留期过滤的视图 —— 否则 `before` 一旦落在可见窗口外就会静默失效，
+     * 落在窗口内又会把过期记录连带抹掉却不上报。
+     *
+     * `before` 非法（含空串）抛 `ConversationDeleteError("invalid_before")`，不碰数据。
+     * 只有**完全不传** `before` / `id` 才是"全清"—— 参数存在但无效绝不退化成全清。
+     */
+    purgeAudit(filter?: AuditPurgeFilter): number {
+        const all = this.readAuditRaw();
+
+        // 先归一化，让非法 before 在动数据之前就失败。
+        const before = filter?.before != null ? normalizeAuditBefore(filter.before) : undefined;
+        const id = filter?.id?.trim() || undefined;
+        const hasFilter = id != null || before != null;
+
+        // 全清：无 filter 时不做逐条比对，keep 直接为空。
+        const keep = hasFilter
+            ? all.filter((rec) => {
+                if (id != null && recordKey(rec) === id) return false;
+                if (before != null && rec.deletedAt && rec.deletedAt < before) return false;
+                return true;
+            })
+            : [];
+        const removed = all.length - keep.length;
+        if (removed === 0) return 0;
+
+        try {
+            this.writeAudit(keep); // keep 为空时内部会删掉文件
+        } catch (err) {
+            log.warn("审计清理失败", { auditPath: this.auditPath, error: String(err) });
+            return 0;
+        }
+        log.info(hasFilter ? "审计已部分清理" : "审计已清空", { removed, remaining: keep.length });
+        return removed;
     }
 
     // ─── 内部 ───
@@ -324,33 +521,68 @@ export class ConversationManager {
         }
     }
 
-    private readAudit(): ConversationDeletionRecord[] {
+    /**
+     * 读取磁盘上的**全部**审计记录（不过滤保留期）。
+     *
+     * 这是"真实状态"的唯一来源，供删除决策（`purgeAudit` / `sweepAudit`）使用；
+     * 展示请走 `readAudit()`。二者刻意分开：过滤是展示策略，不该参与删除决策。
+     * 文件不存在 / 解析失败一律返回空数组 —— 审计是旁路数据，不能拖垮主流程。
+     */
+    private readAuditRaw(): ConversationDeletionRecord[] {
         try {
             if (!fs.existsSync(this.auditPath)) return [];
-            const parsed = JSON.parse(fs.readFileSync(this.auditPath, "utf-8"));
-            return Array.isArray(parsed) ? (parsed as ConversationDeletionRecord[]) : [];
+            const raw = JSON.parse(fs.readFileSync(this.auditPath, "utf-8"));
+            return Array.isArray(raw) ? (raw as ConversationDeletionRecord[]) : [];
         } catch (err) {
             log.warn("审计读取失败", { auditPath: this.auditPath, error: String(err) });
             return [];
         }
     }
 
+    /** 展示视图：在 `readAuditRaw()` 之上按 `auditDays` 过滤掉过期记录。 */
+    private readAudit(): ConversationDeletionRecord[] {
+        const parsed = this.readAuditRaw();
+        const cutoff = resolveAuditCutoffIso(this.auditPolicy().auditDays, this.now());
+        if (!cutoff) return parsed;
+        return parsed.filter((rec) => !rec.deletedAt || rec.deletedAt >= cutoff);
+    }
+
     private appendAudit(record: ConversationDeletionRecord): void {
         try {
-            const dir = path.dirname(this.auditPath);
-            if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            const next = [record, ...this.readAudit()].slice(0, this.auditLimit);
-            fs.writeFileSync(this.auditPath, JSON.stringify(next, null, 2), "utf-8");
+            // 写入前先按保留期过滤 + 截断条数上限，过期记录在这一步被物理丢弃。
+            const { auditLimit } = this.auditPolicy();
+            const limit = auditLimit > 0 ? auditLimit : Number.POSITIVE_INFINITY;
+            const next = [record, ...this.readAudit()].slice(0, limit);
+            this.writeAudit(next);
         } catch (err) {
             // 审计写失败不影响删除本身（已发生的删除无法回滚）
             log.warn("审计写入失败", { auditPath: this.auditPath, error: String(err) });
         }
+    }
+
+    /** 落盘。空数组视为"没有审计"，直接删掉文件（避免留下 `[]` 残骸）。 */
+    private writeAudit(records: ConversationDeletionRecord[]): void {
+        const dir = path.dirname(this.auditPath);
+        if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        if (records.length === 0) {
+            fs.rmSync(this.auditPath, { force: true });
+            return;
+        }
+        fs.writeFileSync(this.auditPath, JSON.stringify(records, null, 2), "utf-8");
     }
 }
 
 function platformOf(chatId: string): string {
     const index = chatId.indexOf(":");
     return index > 0 ? chatId.slice(0, index) : "unknown";
+}
+
+/**
+ * 审计记录的稳定标识。新记录有 `id`；旧记录（本字段引入前写入的）没有，
+ * 退回 `chatId@deletedAt` —— 同一会话同一时刻不可能删两次，够唯一。
+ */
+export function recordKey(record: ConversationDeletionRecord): string {
+    return record.id || `${record.chatId}@${record.deletedAt}`;
 }
 
 /**

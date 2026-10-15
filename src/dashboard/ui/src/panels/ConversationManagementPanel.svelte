@@ -3,18 +3,24 @@
    * ConversationManagementPanel — 会话管理（移除不需要的对话）
    *
    * 每个会话一行，行尾一个「最终确认删除」图标；点开弹窗必须选/填删除理由。
-   * 删除是级联且不可逆的（见 docs/conversation-hygiene-plan.md §6）：
-   * 消息 / 话题 / 运行时实例 / session 文件 / 群组画像都会被清掉；
+   * 删除是级联且不可逆的：消息 / 话题 / 运行时实例 / session 文件 / 群组画像都会被清掉；
    * 记忆（facts / 画像 / digest）不动。
+   *
+   * 审计卡片支持三档清理：单条删除、清空早于 N 天、全部清空。
+   * 全部清空需输入确认词 —— 审计是「谁删了什么」的唯一凭据，删掉就再也查不回来。
    */
   import { activeTab } from '../lib/stores.js';
   import { api } from '../lib/api.js';
   import { platformLabel } from '../lib/utils.js';
 
+  const PURGE_CONFIRM_WORD = '清空';
+
   let loading = false;
   let error = '';
+  let notice = '';
   let conversations = [];
   let audit = [];
+  let auditTotal = 0;
   let presets = [];
 
   let deleting = null;
@@ -22,6 +28,11 @@
   let reasonText = '';
   let submitting = false;
   let deleteModal;
+
+  let purging = false;
+  let purgeBeforeDays = 7;
+  let purgeAllWord = '';
+  let purgeAllModal;
 
   $: if ($activeTab === 'conversation-management') load();
 
@@ -32,6 +43,7 @@
       const data = await api('/conversation-management');
       conversations = data.conversations ?? [];
       audit = data.audit ?? [];
+      auditTotal = data.auditTotal ?? audit.length;
       presets = data.presets ?? [];
       if (!reasonCode) reasonCode = presets[0]?.code ?? '';
     } catch (err) {
@@ -84,6 +96,80 @@
     }
   }
 
+  // ─── 审计清理 ───
+
+  async function purgeOne(rec) {
+    if (purging) return;
+    purging = true;
+    error = '';
+    try {
+      const res = await api(`/conversation-management/audit/${encodeURIComponent(rec.key)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        error = res.error || '删除审计失败';
+        return;
+      }
+      await load();
+    } catch (err) {
+      error = String(err);
+    } finally {
+      purging = false;
+    }
+  }
+
+  async function purgeOlderThan() {
+    if (purging) return;
+    const days = Number(purgeBeforeDays);
+    if (!Number.isFinite(days) || days <= 0) {
+      error = '请输入正数天数';
+      return;
+    }
+    const before = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    if (!confirm(`确定清空 ${days} 天前的审计记录？此操作不可恢复。`)) return;
+    purging = true;
+    error = '';
+    try {
+      const res = await api(`/conversation-management/audit?before=${encodeURIComponent(before)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        error = res.error || '清理审计失败';
+        return;
+      }
+      notice = res.removed > 0 ? `已清理 ${res.removed} 条审计记录` : '没有符合条件的审计记录';
+      await load();
+    } catch (err) {
+      error = String(err);
+    } finally {
+      purging = false;
+    }
+  }
+
+  function openPurgeAll() {
+    purgeAllWord = '';
+    error = '';
+    purgeAllModal?.showModal();
+  }
+
+  $: purgeAllReady = purgeAllWord.trim() === PURGE_CONFIRM_WORD;
+
+  async function confirmPurgeAll() {
+    if (purging || !purgeAllReady) return;
+    purging = true;
+    error = '';
+    try {
+      const res = await api('/conversation-management/audit', { method: 'DELETE' });
+      if (!res.ok) {
+        error = res.error || '清空审计失败';
+        return;
+      }
+      purgeAllModal?.close();
+      notice = res.removed > 0 ? `已清空 ${res.removed} 条审计记录` : '审计已经是空的';
+      await load();
+    } catch (err) {
+      error = String(err);
+    } finally {
+      purging = false;
+    }
+  }
+
   function fmtTime(iso) {
     if (!iso) return '—';
     const t = Date.parse(iso);
@@ -98,6 +184,12 @@
 {#if error}
   <div class="alert alert-error mb-3 py-2 text-sm">
     <span>{error}</span>
+  </div>
+{/if}
+
+{#if notice}
+  <div class="alert alert-info mb-3 py-2 text-sm">
+    <span>{notice}</span>
   </div>
 {/if}
 
@@ -168,7 +260,27 @@
 {#if audit.length > 0}
   <div class="card bg-base-200">
     <div class="card-body p-4">
-      <h3 class="card-title text-base mb-2">删除审计</h3>
+      <h3 class="card-title text-base mb-2">
+        删除审计
+        <span class="text-xs font-normal opacity-60">共 {auditTotal} 条{auditTotal > audit.length ? `，显示最近 ${audit.length} 条` : ''}</span>
+      </h3>
+
+      <div class="flex flex-wrap items-center gap-2 mb-3">
+        <label class="text-xs opacity-70">清理早于</label>
+        <input
+          type="number"
+          min="1"
+          class="input input-bordered input-xs w-20"
+          bind:value={purgeBeforeDays}
+        />
+        <span class="text-xs opacity-70">天</span>
+        <button class="btn btn-xs btn-ghost" onclick={purgeOlderThan} disabled={purging}>清理</button>
+        <div class="flex-1"></div>
+        <button class="btn btn-xs btn-error" onclick={openPurgeAll} disabled={purging || audit.length === 0}>
+          清空全部
+        </button>
+      </div>
+
       <div class="overflow-x-auto">
         <table class="table table-xs">
           <thead>
@@ -178,10 +290,11 @@
               <th>理由</th>
               <th class="text-right">消息</th>
               <th class="text-right">话题</th>
+              <th class="w-10"></th>
             </tr>
           </thead>
           <tbody>
-            {#each audit as rec (rec.chatId + rec.deletedAt)}
+            {#each audit as rec (rec.key ?? rec.chatId + rec.deletedAt)}
               <tr>
                 <td class="text-xs whitespace-nowrap">{fmtTime(rec.deletedAt)}</td>
                 <td>
@@ -197,6 +310,18 @@
                 </td>
                 <td class="text-right">{rec.deleted?.messages ?? 0}</td>
                 <td class="text-right">{rec.deleted?.topics ?? 0}</td>
+                <td>
+                  <button
+                    class="btn btn-xs btn-ghost text-error"
+                    title="删除此条审计"
+                    onclick={() => purgeOne(rec)}
+                    disabled={purging}
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 32 32" fill="currentColor">
+                      <path d="M12 4h8v2h-8zM6 8h20v2H6zm2 4h16v14a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2zm4 3v9h2v-9zm4 0v9h2v-9z" />
+                    </svg>
+                  </button>
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -205,6 +330,36 @@
     </div>
   </div>
 {/if}
+
+<dialog bind:this={purgeAllModal} class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg text-error">清空全部审计</h3>
+    <p class="py-2 text-sm">
+      将删除全部 <span class="font-medium">{auditTotal}</span> 条删除审计记录。
+      <span class="text-error">此操作不可逆，审计记录将不再保留。</span>
+    </p>
+    <p class="text-xs opacity-70 mb-3">
+      审计是「谁在什么时候删了什么」的唯一凭据，清空后无法恢复、也无从追溯。
+    </p>
+
+    <label class="label py-1">
+      <span class="label-text text-sm">请输入「{PURGE_CONFIRM_WORD}」以确认</span>
+    </label>
+    <input
+      class="input input-bordered input-sm w-full"
+      placeholder={PURGE_CONFIRM_WORD}
+      bind:value={purgeAllWord}
+    />
+
+    <div class="modal-action">
+      <button class="btn btn-sm" onclick={() => purgeAllModal?.close()} disabled={purging}>取消</button>
+      <button class="btn btn-sm btn-error" onclick={confirmPurgeAll} disabled={purging || !purgeAllReady}>
+        {purging ? '清空中…' : '确认清空'}
+      </button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
 
 <dialog bind:this={deleteModal} class="modal">
   <div class="modal-box">

@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-10-15: 删除审计支持保留期与手动清理（单条 / 按时间 / 全量）
+
+会话删除的审计（`workspace/conversation-deletions.json`）此前只能读、不能删：
+`listAudit` 是唯一入口，记录靠 `slice(0, 200)` 滚动保留 —— 既删不掉，也留不住全部。
+
+### ✨ 核心改动
+
+- **默认保留 14 天**（`retention.audit_days`，0 = 永久保留）。
+  - `readAudit` 读取时过滤过期记录；`appendAudit` 写入前顺带物理丢弃 → 有删除活动时自动收敛。
+  - 新增 `sweepAudit()` + `startAuditRetention()` 定时器（默认 6 小时，`unref()`），
+    补上「长期没有新删除、过期记录一直躺在磁盘上」的缺口。
+  - 定时器**始终创建**，是否清理由 `sweepAudit()` 每次读配置决定 → `audit_days` 热生效。
+- **条数上限可配**：`retention.audit_limit`（默认 200，0 = 不限）。
+- **`purgeAudit(filter)` 三档清理**：无 filter 全清（直接删文件）；`before` 按时间（**严格小于**，
+  与 `message-retention` 的 cutoff 语义一致）；`id` 单条。
+  全清**刻意不留痕** —— 不做"清空本身也记一笔"的反向审计。
+  ⚠️ 操作对象是**磁盘上的全部记录**（`readAuditRaw`），不是 `listAudit` 那份按保留期过滤的视图 ——
+  用过滤后的视图做删除决策会让 `before` 落在可见窗口外时静默失效、落在窗口内时把过期记录
+  连带抹掉却不上报。过滤是展示策略，不参与删除决策。
+  ⚠️ `before` 入口做 `Date.parse` 校验 + `toISOString()` 归一化，非法值抛
+  `ConversationDeleteError("invalid_before")` 且不碰数据。
+  **绝不因参数非法而退化成"全清"** —— `deletedAt < "garbage"` 在字符串比较下恒为真，
+  一个拼错的 query 就能毁掉全部审计。
+- **记录加稳定 `id`**（`randomUUID`）；`recordKey()` 对旧记录退回 `chatId@deletedAt`，无需迁移。
+- **配置 getter 热生效**：`auditRetention` 支持传 `() => loadConfig().retention`，
+  与 grounding 的 `GroundingConfigSource` 同思路，Dashboard 保存后无需重启。
+- **`ConversationManager` 实例上移到 `main.ts`**（与 `startMessageRetention` 同处生命周期），
+  经 `DashboardDeps.conversationManager` 注入（**必填**，全仓只有这一处构造）；
+  路由侧不再自建兜底实例 —— 那样会绕过定时器、拿不到热更新的配置。
+
+### API
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| `GET` | `/conversation-management` | 追加 `auditTotal`，审计下发 200 条并带 `key` |
+| `DELETE` | `/conversation-management/audit` | 全清（`?before=<ISO>` 则按时间清） |
+| `DELETE` | `/conversation-management/audit/:id` | 删除单条 |
+
+`before` 传了但为空 / 非法 → **400**（不传该参数才是全清），避免误删。
+
+### Dashboard
+
+`ConversationManagementPanel` 审计卡片加「清理早于 N 天」输入 + 「清空全部」按钮 + 每行删除图标。
+全清需输入确认词「清空」—— 审计是"谁删了什么"的唯一凭据，值得比删会话更重的一次确认。
+标题标注「共 N 条，显示最近 M 条」，避免用户误以为显示的就是全部。
+默认天数为 7（**不可与 `audit_days` 默认值 14 同值**，否则 `before` 恰好等于保留期边界，
+清理会恒为空操作）。
+
+### 语义修正
+
+`docs/conversation-hygiene-plan.md` 是**设计稿，从未提交且已清理**，不属于仓库内容。
+`conversation-manager.ts` / `message-retention.ts` / `ConversationManagementPanel.svelte`
+里对它的三处引用已删除。
+
+### 测试
+
+`tests/conversation-management.test.ts` 补 18 个边界用例（保留期过滤 / sweep / 上限截断 /
+三档 purge / cutoff 严格小于 / 旧记录兜底 / getter 热生效 / **before 参数校验与归一化**），
+固定 `now` 消除时间漂移。其中 4 个专锁 `purgeAudit` 与保留期过滤的交互 —— **清理测试的数据
+必须包含已过期记录**，否则该路径零覆盖（初版用例全部使用未过期数据，1162 全绿却不构成
+正确性证据）；3 个锁 `before` 非法输入必须抛错且数据不动。
+
 ## 2026-09-12: MCP 桥接会话过期恢复：404/401 统一判定 + 共享并发重建
 
 部分网关（如 ModelScope 推理端点）会话过期返回 `401 + {"Code":"SessionExpired"}` 而不是 404，

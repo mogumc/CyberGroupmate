@@ -16,6 +16,7 @@ import type { PlatformAdapter } from "../adapter/platform-adapter.js";
 import type { AppConfig } from "../core/config.js";
 import type { AttentionAccumulator } from "../accumulator/attention-accumulator.js";
 import type { MetaSandbox } from "../meta-sandbox/meta-sandbox.js";
+import type { ConversationManager } from "../core/conversation-manager.js";
 
 /** Dashboard 需要的所有组件引用 */
 export interface DashboardDeps {
@@ -28,6 +29,8 @@ export interface DashboardDeps {
     sandboxPool: SandboxPool;
     memory: MemoryStoreV2;
     tokenStats: TokenStatsCollector;
+    /** 会话管理（移除不需要的对话）—— 由 main.ts 构造，与 retention 定时器同处生命周期。 */
+    conversationManager: ConversationManager;
     /** 媒体下载管理器（用于贴纸预览等） */
     mediaDownloader?: MediaDownloader;
     /** 图片目录（用于表情包频率追踪和预览） */

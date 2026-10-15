@@ -509,7 +509,7 @@ export interface ChatFilterConfig {
 }
 
 /**
- * 原始消息保留策略（定期清理 message_log）。
+ * 保留策略：原始消息（message_log）与删除审计。
  *
  * 原始对话是缓存，沉淀后的记忆（话题 / facts / 画像 / session_digests）不受影响。
  */
@@ -518,6 +518,10 @@ export interface RetentionConfig {
     messageLogDays?: number;
     /** 扫描间隔（小时）。默认 6。 */
     sweepIntervalHours?: number;
+    /** 删除审计保留天数。默认 14；设 0 永久保留。 */
+    auditDays?: number;
+    /** 删除审计条数上限。默认 200；设 0 不限。 */
+    auditLimit?: number;
 }
 
 /**
@@ -1079,12 +1083,20 @@ function parseRetentionConfig(fileConfig: Record<string, unknown>): RetentionCon
 
     const daysRaw = raw.message_log_days ?? raw.messageLogDays;
     const hoursRaw = raw.sweep_interval_hours ?? raw.sweepIntervalHours;
+    const auditDaysRaw = raw.audit_days ?? raw.auditDays;
+    const auditLimitRaw = raw.audit_limit ?? raw.auditLimit;
     const parsed: RetentionConfig = {};
     if (typeof daysRaw === "number" && Number.isFinite(daysRaw) && daysRaw >= 0) {
         parsed.messageLogDays = Math.floor(daysRaw);
     }
     if (typeof hoursRaw === "number" && Number.isFinite(hoursRaw) && hoursRaw > 0) {
         parsed.sweepIntervalHours = hoursRaw;
+    }
+    if (typeof auditDaysRaw === "number" && Number.isFinite(auditDaysRaw) && auditDaysRaw >= 0) {
+        parsed.auditDays = Math.floor(auditDaysRaw);
+    }
+    if (typeof auditLimitRaw === "number" && Number.isFinite(auditLimitRaw) && auditLimitRaw >= 0) {
+        parsed.auditLimit = Math.floor(auditLimitRaw);
     }
     return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
@@ -2149,11 +2161,13 @@ export function serializeConfigToObject(config: AppConfig): Record<string, unkno
         });
     }
 
-    // emergency_block
+    // retention（原始消息 + 删除审计的保留策略）
     if (config.retention) {
         const retention: Record<string, unknown> = {};
         if (config.retention.messageLogDays != null) retention.message_log_days = config.retention.messageLogDays;
         if (config.retention.sweepIntervalHours != null) retention.sweep_interval_hours = config.retention.sweepIntervalHours;
+        if (config.retention.auditDays != null) retention.audit_days = config.retention.auditDays;
+        if (config.retention.auditLimit != null) retention.audit_limit = config.retention.auditLimit;
         if (Object.keys(retention).length > 0) obj.retention = retention;
     }
 
@@ -2348,7 +2362,7 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
         }
     }
 
-    // retention（原始消息保留策略）
+    // retention（原始消息 + 删除审计的保留策略）
     const retention = c.retention as Record<string, unknown> | undefined;
     if (retention && typeof retention === "object") {
         const days = retention.messageLogDays ?? retention.message_log_days;
@@ -2358,6 +2372,14 @@ export function validateConfig(config: unknown): { valid: boolean; errors: strin
         const hours = retention.sweepIntervalHours ?? retention.sweep_interval_hours;
         if (hours != null && (typeof hours !== "number" || !Number.isFinite(hours) || hours <= 0)) {
             errors.push("retention.sweep_interval_hours 必须是正数");
+        }
+        const auditDays = retention.auditDays ?? retention.audit_days;
+        if (auditDays != null && (typeof auditDays !== "number" || !Number.isFinite(auditDays) || auditDays < 0)) {
+            errors.push("retention.audit_days 必须是非负数字（0 表示永久保留）");
+        }
+        const auditLimit = retention.auditLimit ?? retention.audit_limit;
+        if (auditLimit != null && (typeof auditLimit !== "number" || !Number.isFinite(auditLimit) || auditLimit < 0)) {
+            errors.push("retention.audit_limit 必须是非负数字（0 表示不限）");
         }
     }
 

@@ -37,9 +37,9 @@ import { getMetaHistoryWindowStatus } from "../main-agent/meta-history-retention
 import { getPlatform } from "../core/chat-id.js";
 import { releaseChatFromFilter, shouldDropInbound } from "../core/inbound-filter.js";
 import {
-    ConversationManager,
     ConversationDeleteError,
     DELETE_REASON_PRESETS,
+    recordKey,
 } from "../core/conversation-manager.js";
 import { resolveBackfillConfig } from "../adapter/backfill.js";
 import { extractAnimatedStickerFrames } from "../core/vision-processor.js";
@@ -455,12 +455,9 @@ function requiredString(value: unknown, fieldName: string): string {
 export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Router {
     const router = Router();
 
-    // 会话管理（移除不需要的对话）：级联清理的单一入口
-    const conversationManager = new ConversationManager({
-        memory: deps.memory,
-        subagentManager: deps.subagentManager,
-        accumulator: deps.accumulator,
-    });
+    // 会话管理（移除不需要的对话）：级联清理的单一入口。
+    // 实例由 main.ts 构造并注入 —— 它同时被审计保留定时器持有，不能在这里另建一份。
+    const conversationManager = deps.conversationManager;
 
     // ─── Overview ───
     router.get("/overview", (_req, res) => {
@@ -1808,13 +1805,49 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
     // 列表 = 运行时实例 ∪ message_log 出现过 ∪ 群组画像，保证"看得到的都能删"。
     router.get("/conversation-management", (_req, res) => {
         try {
+            // key 一并下发：前端删除单条时直接回传，不必自己拼 id / 旧记录兜底。
+            const audit = conversationManager.listAudit(200).map((rec) => ({ ...rec, key: recordKey(rec) }));
             res.json({
                 presets: DELETE_REASON_PRESETS,
                 conversations: conversationManager.listConversations(),
-                audit: conversationManager.listAudit(50),
+                audit,
+                // 真实总数（可能 > 下发条数），前端据此提示"显示最近 N 条"。
+                auditTotal: conversationManager.countAudit(),
             });
         } catch (err) {
             res.status(500).json({ error: String(err) });
+        }
+    });
+
+    // 清空删除审计：不带 before 参数 = 全清；带 ?before=<ISO> = 清早于该时间的记录。
+    // 审计本身是"谁删了什么"的凭据，这里刻意不保留"清空"这个动作的记录。
+    // ⚠️ 参数存在但非法必须报错，不能退化成全清 —— 否则一个拼错的 query 就会毁掉全部审计。
+    router.delete("/conversation-management/audit", (req, res) => {
+        try {
+            const rawBefore = req.query.before;
+            const before = rawBefore == null ? undefined : qs(rawBefore);
+            if (before != null && !before.trim()) {
+                res.status(400).json({ ok: false, error: "before 不能为空（不传该参数表示清空全部）" });
+                return;
+            }
+            const removed = conversationManager.purgeAudit(before ? { before } : undefined);
+            res.json({ ok: true, removed, total: conversationManager.countAudit() });
+        } catch (err) {
+            if (err instanceof ConversationDeleteError) {
+                res.status(400).json({ ok: false, error: err.message, code: err.code });
+                return;
+            }
+            res.status(500).json({ ok: false, error: String(err) });
+        }
+    });
+
+    // 删除单条审计记录。
+    router.delete("/conversation-management/audit/:id", (req, res) => {
+        try {
+            const removed = conversationManager.purgeAudit({ id: req.params.id });
+            res.json({ ok: removed > 0, removed, total: conversationManager.countAudit() });
+        } catch (err) {
+            res.status(500).json({ ok: false, error: String(err) });
         }
     });
 

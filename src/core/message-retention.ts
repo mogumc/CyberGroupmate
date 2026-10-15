@@ -4,7 +4,7 @@
  * 原始对话是「缓存」，沉淀后的记忆（话题 / core_facts / 画像 / session_digests）才是资产。
  * 默认只保留最近 7 天的 `message_log`，更早的定期清掉；记忆层完全不受影响。
  *
- * 只删 message_log 的三个已知副作用（可接受，见 docs/conversation-hygiene-plan.md §7）：
+ * 只删 message_log 的三个已知副作用（可接受）：
  * - topic 归因回查 / reply chain 拿不到更早的消息（摘要已独立存在 topics.summary）；
  * - 补抓水位随之回退，靠 `backfill.maxAgeMinutes`（默认 720）兜住，别调大。
  *

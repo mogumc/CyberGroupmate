@@ -15,6 +15,7 @@ import { ensureCompositeId, getRawId, getPlatform, getGroupModelKey } from "./co
 import { userGate } from "./adapter/user-gate.js";
 import { shouldDropInbound } from "./core/inbound-filter.js";
 import { startMessageRetention } from "./core/message-retention.js";
+import { ConversationManager, startAuditRetention } from "./core/conversation-manager.js";
 import { SandboxPool } from "./sandbox/sandbox-pool.js";
 import type { ShellWakeEvent } from "./sandbox/sandbox.js";
 import { installSkillsDependencies } from "./sandbox/skill-loader.js";
@@ -990,6 +991,16 @@ async function main(): Promise<void> {
     // 只清 message_log；话题 / 记忆 / session digest 不受影响。
     const stopMessageRetention = startMessageRetention({ memory });
 
+    // 删除审计定期清理：默认保留 14 天（config.retention.audit_days，0 = 永久保留）。
+    // 与会话管理共用同一个 ConversationManager 实例（构造后注入 Dashboard）。
+    const conversationManager = new ConversationManager({
+        memory,
+        subagentManager,
+        accumulator,
+        auditRetention: () => loadConfig().retention,
+    });
+    const stopAuditRetention = startAuditRetention(conversationManager);
+
     // Subagent 实例是 chat-bound 的，不做空闲回收。
     // Sandbox 空闲回收由 SandboxPool 独立管理。
 
@@ -1329,6 +1340,7 @@ async function main(): Promise<void> {
                 sandboxPool,
                 memory,
                 tokenStats,
+                conversationManager,
                 mediaDownloader: sharedMediaDownloader,
                 imageCatalog,
                 adapters,
@@ -1757,6 +1769,7 @@ async function main(): Promise<void> {
         clearInterval(reflectionInterval);
         clearInterval(schedulerWatchdogInterval);
         stopMessageRetention();
+        stopAuditRetention();
         for (const timer of backfillTimers) clearTimeout(timer);
         backfillCoordinator?.dispose();
         if (backgroundDreamingInterval) clearInterval(backgroundDreamingInterval);
