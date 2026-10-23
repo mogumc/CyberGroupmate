@@ -11,6 +11,7 @@ import type { AdapterConnectionStatus, BackfillOptions, BackfillResult, Platform
 import { ConnectionTracker } from "./connection-tracker.js";
 import { isNewerThanWatermark, summarizeBackfillNotes } from "./backfill.js";
 import type { MediaDownloader } from "../core/media-downloader.js";
+import type { StickerSendPolicy } from "../core/sticker-send-policy.js";
 import { ensureSupportedFormat } from "../core/vision-processor.js";
 import { composeChatId, ensureCompositeId, getRawId, parseChatId } from "../core/chat-id.js";
 import { assertNoAccidentalTextMention, outgoingOneBotMentions, validateOneBotMentionTarget } from "../core/onebot-mentions.js";
@@ -203,6 +204,7 @@ export class OneBotAdapter implements PlatformAdapter {
         private config: OneBotConfig,
         private nc: NotificationCenter,
         private mediaDownloader?: MediaDownloader,
+        private stickerPolicy?: StickerSendPolicy,
     ) {}
 
     async start(): Promise<void> {
@@ -738,6 +740,16 @@ export class OneBotAdapter implements PlatformAdapter {
                 await this.applyHumanizedDelay(chatId, caption.length);
                 return this.sendSticker(chatId, sticker, opts);
             }
+            case "onebot.searchStickers":
+            case "qq.searchStickers": {
+                if (!this.stickerPolicy) throw new Error("onebot.searchStickers: stickerPolicy not injected into OneBotAdapter");
+                const query = (args[0] ?? {}) as Record<string, unknown>;
+                return this.stickerPolicy.searchStickers({
+                    emoji: typeof query.emoji === "string" || Array.isArray(query.emoji) ? (query.emoji as string | string[]) : undefined,
+                    keywords: typeof query.keywords === "string" || Array.isArray(query.keywords) ? (query.keywords as string | string[]) : undefined,
+                    limit: typeof query.limit === "number" && Number.isFinite(query.limit) ? query.limit : undefined,
+                });
+            }
             case "onebot.sendFace":
             case "qq.sendFace": {
                 const chatId = ensureCompositeId("onebot", String(args[0] ?? ""));
@@ -1060,6 +1072,22 @@ export class OneBotAdapter implements PlatformAdapter {
     }
 
     private async sendSticker(chatId: string, sticker: unknown, opts: Record<string, unknown>): Promise<unknown> {
+        // 贴纸发送策略：引用贴纸库（uniqueFileId 或媒体缓存命中）时按 allowlist 校验；
+        // 库外文件/URL 在 allow_listed / disallow_all 下同样拦截。
+        if (this.stickerPolicy) {
+            let libraryId: string | undefined;
+            if (sticker && typeof sticker === "object" && !Array.isArray(sticker)) {
+                const rec = sticker as Record<string, unknown>;
+                if (typeof rec.uniqueFileId === "string" && rec.uniqueFileId) libraryId = rec.uniqueFileId;
+            } else if (typeof sticker === "string" && this.mediaDownloader?.getExistingPath(sticker.trim())) {
+                libraryId = sticker.trim();
+            }
+            this.stickerPolicy.assertSendAllowed(libraryId, {
+                method: "onebot.sendSticker",
+                searchApi: "onebot.searchStickers",
+            });
+        }
+
         let file: unknown = sticker;
 
         if (typeof sticker === "string") {
@@ -1620,11 +1648,16 @@ export class OneBotAdapter implements PlatformAdapter {
 
 
     /**
-     * 处理 OneBot notice 事件：群名变更、群成员昵称变更等。
-     * 这些事件用于实时更新缓存，确保 chatTitle 始终反映最新状态。
+     * 处理 OneBot notice 事件：群名变更、群成员昵称变更、戳一戳等。
+     * 群名/昵称事件用于实时更新缓存；戳一戳合成 nc.message 让 agent 感知。
      */
     private handleNoticeEvent(event: OneBotIncomingEvent): void {
         const noticeType = (event as Record<string, unknown>).notice_type;
+
+        if (noticeType === "notify" && event.sub_type === "poke") {
+            this.handlePokeNotice(event);
+            return;
+        }
 
         if (noticeType === "group_name_change") {
             // 群名变更事件（NapCat 扩展）
@@ -1648,6 +1681,95 @@ export class OneBotAdapter implements PlatformAdapter {
             }
             return;
         }
+    }
+
+    /**
+     * 处理戳一戳 notice（OneBot v11: notice_type=notify + sub_type=poke）。
+     *
+     * NapCat 群戳带 group_id/user_id（发起者）/target_id（被戳者），好友戳只有
+     * user_id/target_id。合成为 nc.message（模式同飞书 Reaction 事件）：
+     * - 戳 bot 本身或私聊戳 → mentionsAgent/_urgent，走直接唤醒路径；
+     * - 戳其他群友 → 仅作为环境上下文落盘/聚类，不唤醒。
+     * NapCat 会回显 bot 自己发起的 poke，这类不再作为入站事件上报，避免自我反馈。
+     */
+    private handlePokeNotice(event: OneBotIncomingEvent): void {
+        const rec = event as Record<string, unknown>;
+        const selfId = String(this.config.selfId);
+        if (rec.self_id != null && String(rec.self_id) !== selfId) return;
+
+        const pokerId = String(rec.user_id ?? "");
+        if (!pokerId || pokerId === selfId) return;
+        const targetId = rec.target_id != null ? String(rec.target_id) : "";
+        const groupId = rec.group_id != null ? String(rec.group_id) : "";
+
+        (async () => {
+            const isGroup = !!groupId;
+            const chatId = isGroup
+                ? composeChatId("onebot", `group:${groupId}`)
+                : composeChatId("onebot", `private:${pokerId}`);
+            const pokerName = await this.fetchMentionDisplayName(pokerId, isGroup ? groupId : undefined) ?? pokerId;
+            const pokedSelf = targetId === selfId;
+            const targetName = pokedSelf
+                ? "你"
+                : targetId
+                    ? await this.fetchMentionDisplayName(targetId, isGroup ? groupId : undefined) ?? targetId
+                    : "";
+            const text = targetName
+                ? `[👉 戳一戳] ${pokerName} 戳了${targetName === "你" ? "你" : ` ${targetName}`}`
+                : `[👉 戳一戳] ${pokerName} 发起戳一戳`;
+
+            const displayName = pokerName;
+            const chatTitle = isGroup
+                ? await this.fetchGroupName(groupId) ?? groupId
+                : await this.fetchUserNickname(pokerId) ?? displayName;
+            const timestamp = new Date((event.time ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
+            // 戳一戳没有 message_id；合成唯一 ID 避免 message_log (chat_id, message_id) 主键去重丢事件
+            const messageId = `poke_${event.time ?? Date.now()}_${pokerId}_${targetId || "0"}_${Math.random().toString(36).slice(2, 8)}`;
+            const isDirectMessage = !isGroup;
+            const mentionsAgent = pokedSelf;
+
+            const core = {
+                chatId,
+                userId: composeChatId("onebot", pokerId),
+                displayName,
+                text,
+                timestamp,
+                messageId,
+                chatTitle,
+                chatType: isGroup ? "group" : "private",
+                isDirectMessage,
+                mentionsAgent,
+                mentions: [],
+                messageSegments: [],
+            };
+            const source = {
+                scene: "onebot",
+                platform: "onebot",
+                chatId,
+                userId: core.userId,
+                chatType: core.chatType,
+                messageId,
+            };
+            const platformData = {
+                originalType: "notice.notify.poke",
+                pokerUserId: pokerId,
+                targetUserId: targetId || undefined,
+                groupId: groupId || undefined,
+                pokedSelf,
+            };
+
+            this.nc.push({
+                type: "nc.message",
+                scene: "onebot",
+                ...core,
+                source,
+                payload: { scene: "onebot", ...core, source, platformData },
+                _urgent: isDirectMessage || mentionsAgent,
+            } as never);
+            log.info("戳一戳事件已合成 nc.message", { chatId, pokerId, targetId: targetId || undefined, pokedSelf });
+        })().catch(err => {
+            log.warn("处理戳一戳事件失败", { error: String(err) });
+        });
     }
 
     /**

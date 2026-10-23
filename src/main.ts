@@ -44,6 +44,7 @@ import { readMessageMentions } from "./core/message-provenance.js";
 import { createLogger } from "./core/logger.js";
 import { setGlobalTimezone, getGlobalTimezone } from "./core/timezone.js";
 import { TelegramAdapter } from "./adapter/telegram-adapter.js";
+import { StickerSendPolicy } from "./core/sticker-send-policy.js";
 import { DiscordAdapter } from "./adapter/discord-adapter.js";
 import { OneBotAdapter } from "./adapter/onebot-adapter.js";
 import { QQBotOfficialAdapter } from "./adapter/qqbot-official-adapter.js";
@@ -473,6 +474,8 @@ async function main(): Promise<void> {
 
     // ─── Adapter 初始化（条件性创建） ───
     const adapters: PlatformAdapter[] = [];
+    // 贴纸发送策略：adapter 层强制执行 vision.sticker_sending_mode（模式经 loadConfig 热读取，Dashboard 保存即时生效）
+    const stickerSendPolicy = new StickerSendPolicy(memory);
 
     if (appConfig.telegram) {
         // 单一 TelegramAdapter，内部按 mode 选择驱动：
@@ -486,6 +489,7 @@ async function main(): Promise<void> {
             (message) => console.log(`🤖 ${message}`),
             undefined, // use default client factory
             sharedMediaDownloader,
+            stickerSendPolicy,
         );
         adapters.push(telegramAdapter);
     }
@@ -496,7 +500,7 @@ async function main(): Promise<void> {
     }
 
     if (appConfig.onebot) {
-        const onebotAdapter = new OneBotAdapter(appConfig.onebot, nc, sharedMediaDownloader);
+        const onebotAdapter = new OneBotAdapter(appConfig.onebot, nc, sharedMediaDownloader, stickerSendPolicy);
         adapters.push(onebotAdapter);
     }
 
