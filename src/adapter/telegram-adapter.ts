@@ -43,6 +43,43 @@ function normalizeWhitelistId(raw: string): string {
     return s;
 }
 
+/**
+ * 读文件头判断贴纸容器格式 —— 只认字节，不认扩展名。
+ *
+ * 扩展名会撒谎：动图贴纸一旦被落盘成 .webp（本仓库曾因 Bot API 缺 mime_type 造成），
+ * 按扩展名分类就会把 webm/tgs 当静态贴纸发出去；NapCat 也有用 .webp 后缀存 GIF 的情况。
+ *
+ * 返回 undefined 表示判断不出（文件读不到或头部不认识），调用方应退回扩展名逻辑。
+ */
+export function sniffStickerContainer(filePath: string): "tgs" | "webm" | "webp" | "gif" | "image" | undefined {
+    let fd: number | undefined;
+    try {
+        fd = fs.openSync(filePath, "r");
+        const head = Buffer.alloc(16);
+        const read = fs.readSync(fd, head, 0, head.length, 0);
+        if (read >= 4) {
+            // Matroska / WebM：1A 45 DF A3（视频贴纸与普通视频同容器，此处无需再区分）
+            if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return "webm";
+            // TGS 是 gzip 压缩的 Lottie JSON；贴纸链路上出现的 gzip 只能是 TGS
+            if (head[0] === 0x1f && head[1] === 0x8b) return "tgs";
+            // GIF87a / GIF89a
+            if (head.toString("latin1", 0, 3) === "GIF") return "gif";
+            // PNG / JPEG：本身不是合法贴纸格式，需要转码成 webp
+            if (read >= 8 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return "image";
+            if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return "image";
+            // WebP：RIFF....WEBP
+            if (read >= 12 && head.toString("latin1", 0, 4) === "RIFF" && head.toString("latin1", 8, 12) === "WEBP") return "webp";
+        }
+    } catch {
+        /* 读不到就交给扩展名兜底 */
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch { /* ignore */ }
+        }
+    }
+    return undefined;
+}
+
 // ─── 常量 ───
 
 const DEFAULT_MEDIA_CACHE_DIR = "workspace/media-cache";
@@ -2051,32 +2088,41 @@ export class TelegramAdapter implements PlatformAdapter {
 
     private prepareOutgoingStickerForTelegram(sourcePath: string): PreparedTelegramSticker {
         const lowerPath = sourcePath.toLowerCase();
-        if (lowerPath.endsWith(".tgs")) {
+        const stem = path.basename(sourcePath, path.extname(sourcePath));
+        // 容器格式以文件头为准，扩展名只在头部判不出时兜底（见 sniffStickerContainer）
+        const container = sniffStickerContainer(sourcePath)
+            ?? (lowerPath.endsWith(".tgs") ? "tgs"
+                : lowerPath.endsWith(".webm") ? "webm"
+                : lowerPath.endsWith(".webp") ? "webp"
+                : undefined);
+
+        if (container === "tgs") {
             return {
                 kind: "animated",
                 path: sourcePath,
-                fileName: this.ensureFileNameExtension(path.basename(sourcePath), ".tgs"),
+                fileName: `${stem}.tgs`,
                 mimeType: "application/x-tgsticker",
             };
         }
-        if (lowerPath.endsWith(".webm")) {
+        if (container === "webm") {
             return {
                 kind: "video",
                 path: sourcePath,
-                fileName: this.ensureFileNameExtension(path.basename(sourcePath), ".webm"),
+                fileName: `${stem}.webm`,
                 mimeType: "video/webm",
             };
         }
-        if (lowerPath.endsWith(".webp")) {
+        if (container === "webp") {
             return {
                 kind: "static",
                 path: sourcePath,
                 buffer: fs.readFileSync(sourcePath),
-                fileName: this.ensureFileNameExtension(path.basename(sourcePath), ".webp"),
+                fileName: `${stem}.webp`,
                 mimeType: "image/webp",
             };
         }
 
+        // gif / image / 未知：交给动态探测（ffprobe 数帧）与转 webp 处理
         if (this.isAnimatedStickerSource(sourcePath)) {
             try {
                 const webmPath = this.convertStickerAnimationToTelegramWebm(sourcePath);
@@ -2105,7 +2151,8 @@ export class TelegramAdapter implements PlatformAdapter {
     }
 
     private async prepareOutgoingStaticStickerFallbackForTelegram(sourcePath: string): Promise<Extract<PreparedTelegramSticker, { kind: "static" }>> {
-        const fallbackSourcePath = sourcePath.toLowerCase().endsWith(".tgs")
+        // 同样以字节为准：落盘成 .webp 的 TGS 也要能渲染首帧，否则 ffmpeg 会在 gzip 上失败
+        const fallbackSourcePath = sniffStickerContainer(sourcePath) === "tgs"
             ? await this.renderTgsStickerFirstFrameToPng(sourcePath)
             : sourcePath;
         const webpPath = this.convertStickerImageToTelegramWebp(fallbackSourcePath);
@@ -2322,10 +2369,6 @@ export class TelegramAdapter implements PlatformAdapter {
         } catch {
             return {};
         }
-    }
-
-    private ensureFileNameExtension(fileName: string, ext: ".webp" | ".webm" | ".tgs"): string {
-        return fileName.toLowerCase().endsWith(ext) ? fileName : `${fileName}${ext}`;
     }
 
     private hasUsableFile(filePath: string): boolean {

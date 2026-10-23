@@ -38,6 +38,10 @@ type BotApiFile = {
     width?: number;
     height?: number;
     emoji?: string;
+    /** Sticker 专属：动画贴纸（.tgs） */
+    is_animated?: boolean;
+    /** Sticker 专属：视频贴纸（.webm） */
+    is_video?: boolean;
 };
 
 type BotApiMessage = {
@@ -67,6 +71,24 @@ type BotApiUpdate = {
     channel_post?: BotApiMessage;
     edited_channel_post?: BotApiMessage;
 };
+
+/**
+ * Bot API 的 Sticker 对象既没有 mime_type 也没有 file_name，只提供 is_animated / is_video 两个布尔。
+ * 这里把它翻译成下游通用的 mimeType + 文件名：
+ * 不翻译的话动图贴纸会被当成 image/webp 送进 vision 识别（必然失败、失败又不写缓存 → 反复重试），
+ * 落盘时还会被错误地存成 .webp。
+ */
+export function resolveBotApiStickerFormat(sticker: {
+    file_id?: string;
+    file_unique_id?: string;
+    is_animated?: boolean;
+    is_video?: boolean;
+}): { mimeType: string; fileName?: string } {
+    const base = sticker.file_unique_id ?? sticker.file_id;
+    if (sticker.is_video) return { mimeType: "video/webm", fileName: base ? `${base}.webm` : undefined };
+    if (sticker.is_animated) return { mimeType: "application/x-tgsticker", fileName: base ? `${base}.tgs` : undefined };
+    return { mimeType: "image/webp", fileName: base ? `${base}.webp` : undefined };
+}
 
 /**
  * HTTP client selected explicitly by mode: bot_api.
@@ -553,12 +575,14 @@ export class TelegramBotApiClient {
             : message.audio ? "audio"
             : message.voice ? "voice"
             : "sticker";
+        // Sticker 缺 mime_type / file_name，由 is_video / is_animated 反推格式（见 resolveBotApiStickerFormat）
+        const stickerFormat = type === "sticker" ? resolveBotApiStickerFormat(source) : undefined;
         return {
             type,
             fileId: source.file_id,
             uniqueFileId: source.file_unique_id,
-            fileName: source.file_name,
-            mimeType: source.mime_type,
+            fileName: source.file_name ?? stickerFormat?.fileName,
+            mimeType: stickerFormat?.mimeType ?? source.mime_type,
             fileSize: source.file_size,
             width: source.width,
             height: source.height,
