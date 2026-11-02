@@ -42,6 +42,7 @@ import {
 import { join, resolve, relative } from "node:path";
 import { readMessageMentions } from "./core/message-provenance.js";
 import { createLogger } from "./core/logger.js";
+import { writeCrashReport } from "./core/crash-report.js";
 import { setGlobalTimezone, getGlobalTimezone } from "./core/timezone.js";
 import { TelegramAdapter } from "./adapter/telegram-adapter.js";
 import { StickerSendPolicy } from "./core/sticker-send-policy.js";
@@ -1862,6 +1863,17 @@ process.once("SIGINT", () => {
 
 process.once("SIGTERM", () => {
     void requestGracefulShutdown("SIGTERM");
+});
+
+// ─── Crash forensics ───
+// 只做取证落盘，不改变默认致命语义：写完报告即退出，交给 systemd Restart=always 拉起。
+process.on("uncaughtException", (error) => {
+    writeCrashReport("uncaughtException", error);
+    process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+    writeCrashReport("unhandledRejection", reason);
+    process.exit(1);
 });
 
 main().catch((err) => {
