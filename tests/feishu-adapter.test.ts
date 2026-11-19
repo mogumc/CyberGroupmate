@@ -11,6 +11,13 @@ import { createFeishuHttpInstance, FeishuAdapter, type FeishuAdapterDependencies
 const config = { appId: "cli_0123456789abcdef", appSecret: "secret-never-in-errors" };
 const time = "1767225600123";
 
+/** 模拟飞书 SDK 抛出的业务错误：code 挂在不可枚举的 error.feishu 上。 */
+function feishuError(code: number, msg: string): Error {
+    const error = new Error(`Feishu API business failure (${code})`);
+    Object.defineProperty(error, "feishu", { value: { code, msg }, enumerable: false });
+    return error;
+}
+
 function incoming(overrides: Record<string, unknown> = {}, senderId = "ou_user") {
     return {
         sender: { sender_id: { open_id: senderId }, sender_type: "user" },
@@ -186,6 +193,111 @@ describe("Feishu adapter ingress edges", () => {
         } finally { await f.adapter.stop(); }
     });
 
+    it("resolves live message names from chat members when contact lookup is denied", async () => {
+        const f = fixture();
+        let contactCalls = 0;
+        let pages = 0;
+        f.client.contact!.v3!.user!.get = async () => { contactCalls++; throw new Error("no user authority error"); };
+        f.client.im.v1.chatMembers = {
+            get: async payload => {
+                pages++;
+                if (pages === 1) {
+                    assert.equal(payload?.params?.member_id_type, "open_id");
+                    assert.equal(payload?.params?.page_size, 100);
+                    return { code: 0, data: { items: [{ member_id: "ou_other", name: "Other" }], has_more: true, page_token: "next" } };
+                }
+                assert.equal(payload?.params?.page_token, "next");
+                return { code: 0, data: { items: [{ member_id: "ou_user", name: "Alice" }], has_more: false } };
+            },
+        };
+        await f.adapter.start();
+        try {
+            await f.connections[0].receive(incoming());
+            assert.equal(f.events[0].displayName, "Alice");
+            assert.equal(pages, 2);
+            assert.equal(contactCalls, 0);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("resolves live message names from message.get before chat members and contact", async () => {
+        const f = fixture();
+        let contactCalls = 0;
+        let memberCalls = 0;
+        f.client.contact!.v3!.user!.get = async () => { contactCalls++; throw new Error("no user authority error"); };
+        f.client.im.v1.chatMembers = {
+            get: async () => { memberCalls++; return { code: 0, data: { items: [], has_more: false } }; },
+        };
+        f.messages.set("om_one", {
+            message_id: "om_one", chat_id: "oc_chat", chat_type: "group", msg_type: "text",
+            body: { content: '{"text":"ordinary conversation"}' },
+            sender: { id: "ou_user", id_type: "open_id", sender_name: "Alice" }, create_time: time,
+        });
+        await f.adapter.start();
+        try {
+            await f.connections[0].receive(incoming());
+            assert.equal(f.events[0].displayName, "Alice");
+            assert.equal(contactCalls, 0);
+            assert.equal(memberCalls, 0);
+            const get = f.calls.find(call => call.method === "get");
+            assert.ok(get);
+            assert.equal(get.payload.path.message_id, "om_one");
+            assert.equal(get.payload.params.with_sender_name, true);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("coalesces concurrent name lookups for the same user", async () => {
+        const f = fixture();
+        const originalGet = f.client.im.v1.message.get;
+        let getCalls = 0;
+        let started!: () => void;
+        let release!: () => void;
+        const startedPromise = new Promise<void>(resolve => { started = resolve; });
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        f.client.im.v1.message.get = async payload => {
+            getCalls++;
+            started();
+            await gate;
+            return originalGet(payload);
+        };
+        for (const messageId of ["om_a", "om_b"]) {
+            f.messages.set(messageId, {
+                message_id: messageId, chat_id: "oc_chat", chat_type: "group", msg_type: "text",
+                body: { content: '{"text":"hello"}' },
+                sender: { id: "ou_user", id_type: "open_id", sender_name: "Alice" }, create_time: time,
+            });
+        }
+        await f.adapter.start();
+        try {
+            const first = f.connections[0].receive(incoming({ message_id: "om_a" }));
+            await startedPromise;
+            const second = f.connections[0].receive(incoming({ message_id: "om_b" }));
+            await new Promise(resolve => setTimeout(resolve, 0));
+            assert.equal(getCalls, 1);
+            release();
+            await Promise.all([first, second]);
+            assert.equal(getCalls, 1);
+            assert.deepEqual(f.events.map(event => event.displayName), ["Alice", "Alice"]);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("does not use another sender's name from message.get", async () => {
+        const f = fixture();
+        f.client.contact!.v3!.user!.get = async () => { throw new Error("no user authority error"); };
+        f.client.im.v1.chatMembers = {
+            get: async () => ({ code: 0, data: { items: [], has_more: false } }),
+        };
+        f.messages.set("om_one", {
+            message_id: "om_one", chat_id: "oc_chat", chat_type: "group", msg_type: "text",
+            body: { content: '{"text":"ordinary conversation"}' },
+            sender: { id: "ou_other", id_type: "open_id", sender_name: "Other" }, create_time: time,
+        });
+        await f.adapter.start();
+        try {
+            await f.connections[0].receive(incoming());
+            assert.equal(f.events[0].displayName, "feishu:ou_user");
+        } finally { await f.adapter.stop(); }
+    });
+
     it("suppresses persisted IDs, ignores self, and bounds in-process dedup", async () => {
         const f = fixture({ dedupLimit: 2, hasMessage: (_, id) => id === "om_saved" });
         await f.adapter.start();
@@ -256,6 +368,74 @@ describe("Feishu adapter ingress edges", () => {
         } finally { await f.adapter.stop(); }
     });
 
+    it("refetches degraded live card events with the full card content", async () => {
+        const f = fixture();
+        const degradedCard = { title: "示例卡片标题", elements: [[{ tag: "text", text: "请升级至最新版本客户端，以查看内容" }]] };
+        const fullCard = {
+            schema: "2.0",
+            header: { template: "green", title: { tag: "plain_text", content: "示例卡片标题" } },
+            body: { elements: [{ tag: "markdown", content: "这是一段示例卡片正文，用于验证卡片内容解析。" }] },
+        };
+        f.messages.set("om_live_card", {
+            message_id: "om_live_card", chat_id: "oc_chat", chat_type: "group", msg_type: "interactive",
+            body: { content: JSON.stringify(fullCard) }, sender: { id: "ou_user", id_type: "open_id" }, create_time: time,
+        });
+        await f.adapter.start();
+        try {
+            await f.connections[0].receive(incoming({ message_id: "om_live_card", message_type: "interactive", content: JSON.stringify(degradedCard) }));
+            await waitFor(() => f.events.length > 0);
+            const text = String(f.events[0].text);
+            assert.match(text, /示例卡片标题/);
+            assert.match(text, /这是一段示例卡片正文/);
+            assert.doesNotMatch(text, /请升级至最新版本客户端/);
+            assert.ok(f.calls.some(call => call.method === "get" && call.payload.params.card_msg_content_type === "user_card_content"));
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("detects English degraded card placeholders", async () => {
+        const f = fixture();
+        const degradedCard = { title: "Sample Card", elements: [[{ tag: "text", text: "Please upgrade to the latest version of the client to view the content." }]] };
+        const fullCard = {
+            schema: "2.0",
+            header: { title: { tag: "plain_text", content: "Sample Card" } },
+            body: { elements: [{ tag: "markdown", content: "Sample card body content" }] },
+        };
+        f.messages.set("om_live_card_en", {
+            message_id: "om_live_card_en", chat_id: "oc_chat", chat_type: "group", msg_type: "interactive",
+            body: { content: JSON.stringify(fullCard) }, sender: { id: "ou_user", id_type: "open_id" }, create_time: time,
+        });
+        await f.adapter.start();
+        try {
+            await f.connections[0].receive(incoming({ message_id: "om_live_card_en", message_type: "interactive", content: JSON.stringify(degradedCard) }));
+            await waitFor(() => f.events.length > 0);
+            const text = String(f.events[0].text);
+            assert.match(text, /Sample card body content/);
+            assert.doesNotMatch(text, /Please upgrade/);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("rejects cross-chat card content when refetching degraded events", async () => {
+        const f = fixture();
+        const degradedCard = { title: "Sample Card", elements: [[{ tag: "text", text: "请升级至最新版本客户端，以查看内容" }]] };
+        const foreignCard = {
+            schema: "2.0",
+            header: { title: { tag: "plain_text", content: "Sample Card" } },
+            body: { elements: [{ tag: "markdown", content: "secret cross-chat content" }] },
+        };
+        f.messages.set("om_foreign_card", {
+            message_id: "om_foreign_card", chat_id: "oc_other", chat_type: "group", msg_type: "interactive",
+            body: { content: JSON.stringify(foreignCard) }, sender: { id: "ou_user", id_type: "open_id" }, create_time: time,
+        });
+        await f.adapter.start();
+        try {
+            await f.connections[0].receive(incoming({ message_id: "om_foreign_card", message_type: "interactive", content: JSON.stringify(degradedCard) }));
+            await waitFor(() => f.events.length > 0);
+            const text = String(f.events[0].text);
+            assert.match(text, /请升级至最新版本客户端/);
+            assert.doesNotMatch(text, /secret cross-chat content/);
+        } finally { await f.adapter.stop(); }
+    });
+
     it("normalizes audio/video resources and preserves every attachment", async () => {
         const f = fixture();
         await f.adapter.start();
@@ -290,9 +470,90 @@ describe("Feishu adapter ingress edges", () => {
             assert.equal(f.events[0].replyToMessageId, "om_bot");
             assert.equal(f.events[0]._urgent, true);
             assert.equal(f.events[1].displayName, "Reactor");
-            assert.equal(f.events[1].text, "[Reaction added: THUMBSUP]");
+            assert.equal(f.events[1].text, "[👍 表态] 给消息点了「赞」");
             assert.equal(f.events[1].mentionsAgent, true);
             assert.equal((f.events[1].payload as any).platformData.originalType, "im.message.reaction.created_v1");
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("resolves reaction operator names from chat members when contact lookup is denied", async () => {
+        const f = fixture();
+        let contactCalls = 0;
+        f.client.contact!.v3!.user!.get = async () => { contactCalls++; throw new Error("no user authority error"); };
+        f.client.im.v1.chatMembers = {
+            get: async () => ({ code: 0, data: { items: [{ member_id: "ou_reactor", name: "Reactor" }], has_more: false } }),
+        };
+        f.messages.set("om_bot", { message_id: "om_bot", chat_id: "oc_chat", chat_type: "group", msg_type: "text", body: { content: '{"text":"bot message"}' }, sender: { id: "ou_bot", id_type: "open_id" }, create_time: time });
+        await f.adapter.start();
+        try {
+            await f.connections[0].handlers["im.message.reaction.created_v1"]({
+                event_id: "evt_reaction",
+                event: { message_id: "om_bot", user_id: { open_id: "ou_reactor" }, reaction_type: { emoji_type: "THUMBSUP" }, action_time: time },
+            });
+            assert.equal(f.events[0].displayName, "Reactor");
+            assert.equal(contactCalls, 0);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("paginates chat member names beyond ten pages", async () => {
+        const f = fixture();
+        let pages = 0;
+        f.client.contact!.v3!.user!.get = async () => { throw new Error("no user authority error"); };
+        f.client.im.v1.chatMembers = {
+            get: async () => {
+                pages++;
+                const last = pages === 11;
+                return {
+                    code: 0,
+                    data: {
+                        items: [{ member_id: last ? "ou_reactor" : `ou_user_${pages}`, name: last ? "Reactor" : `User ${pages}` }],
+                        has_more: !last,
+                        ...(last ? {} : { page_token: `page_${pages + 1}` }),
+                    },
+                };
+            },
+        };
+        f.messages.set("om_bot", { message_id: "om_bot", chat_id: "oc_chat", chat_type: "group", msg_type: "text", body: { content: '{"text":"bot message"}' }, sender: { id: "ou_bot", id_type: "open_id" }, create_time: time });
+        await f.adapter.start();
+        try {
+            await f.connections[0].handlers["im.message.reaction.created_v1"]({
+                event_id: "evt_reaction",
+                event: { message_id: "om_bot", user_id: { open_id: "ou_reactor" }, reaction_type: { emoji_type: "THUMBSUP" }, action_time: time },
+            });
+            assert.equal(f.events[0].displayName, "Reactor");
+            assert.equal(pages, 11);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("refreshes cached member names after membership changes", async () => {
+        const f = fixture();
+        let memberCalls = 0;
+        let memberName = "Old";
+        f.client.contact!.v3!.user!.get = async () => { throw new Error("no user authority error"); };
+        f.client.im.v1.chatMembers = {
+            get: async () => {
+                memberCalls++;
+                return { code: 0, data: { items: [{ member_id: "ou_reactor", name: memberName }], has_more: false } };
+            },
+        };
+        f.messages.set("om_bot", { message_id: "om_bot", chat_id: "oc_chat", chat_type: "group", msg_type: "text", body: { content: '{"text":"bot message"}' }, sender: { id: "ou_bot", id_type: "open_id" }, create_time: time });
+        await f.adapter.start();
+        try {
+            const react = (eventId: string) => f.connections[0].handlers["im.message.reaction.created_v1"]({
+                event_id: eventId,
+                event: { message_id: "om_bot", user_id: { open_id: "ou_reactor" }, reaction_type: { emoji_type: "THUMBSUP" }, action_time: time },
+            });
+            await react("evt_old");
+            memberName = "New";
+            await f.connections[0].handlers["im.chat.member.user.added_v1"]({
+                event_id: "evt_member",
+                event: { chat_id: "oc_chat", users: [{ user_id: { open_id: "ou_reactor" } }] },
+            });
+            await react("evt_new");
+            const messages = f.events.filter(event => event.type === "nc.message");
+            assert.equal(messages[0].displayName, "Old");
+            assert.equal(messages[1].displayName, "New");
+            assert.equal(memberCalls, 2);
         } finally { await f.adapter.stop(); }
     });
 
@@ -306,7 +567,7 @@ describe("Feishu adapter ingress edges", () => {
             await f.connections[0].receive(incoming({ message_id: "om_merge", message_type: "merge_forward", content: "Merged and Forwarded Message" }));
             const event = f.events[0];
             assert.match(String(event.text), /Alice: child text/);
-            assert.match(String(event.text), /Bob: \[Sticker: sticker_key\]/);
+            assert.match(String(event.text), /Bob: \[🎭 贴纸\]/);
             assert.equal((event.forwardedMessages as unknown[]).length, 2);
             assert.equal(event.mediaInfo, undefined);
             assert.ok((event.forwardedMessages as any[]).every(child => child.mediaInfo === undefined && child.mediaInfos === undefined));
@@ -525,6 +786,212 @@ describe("Feishu adapter host boundary edges", () => {
         } finally { await f.adapter.stop(); }
     });
 
+    it("normalizes composite IDs before native SDK calls and accepts app_id member removal", async () => {
+        const f = fixture();
+        const calls: Array<{ action: string; payload: any }> = [];
+        const native = (action: string) => async (payload: any) => {
+            calls.push({ action, payload });
+            return { code: 0, data: {} };
+        };
+        f.client.im.v1.message.forward = native("forward");
+        f.client.im.v1.chatMembers = { delete: native("membersDelete") };
+        await f.adapter.start();
+        try {
+            await f.adapter.callApi("feishu:oc_chat", "message.forward", {
+                path: { message_id: "feishu:om_parent" },
+                params: { receive_id_type: "chat_id" },
+                data: { receive_id: "feishu:oc_chat" },
+            });
+            await f.adapter.callApi("feishu:oc_chat", "chatMembers.delete", {
+                path: { chat_id: "feishu:oc_chat" },
+                params: { member_id_type: "app_id" },
+                data: { id_list: [`feishu:${config.appId}`] },
+            });
+            assert.deepEqual(calls, [
+                {
+                    action: "forward",
+                    payload: {
+                        path: { message_id: "om_parent" },
+                        params: { receive_id_type: "chat_id" },
+                        data: { receive_id: "oc_chat" },
+                    },
+                },
+                {
+                    action: "membersDelete",
+                    payload: {
+                        path: { chat_id: "oc_chat" },
+                        params: { member_id_type: "app_id" },
+                        data: { id_list: [config.appId] },
+                    },
+                },
+            ]);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("rejects invalid member ID types and empty membership payloads", async () => {
+        const f = fixture();
+        const nativeCalls: unknown[] = [];
+        const native = async (payload: unknown) => { nativeCalls.push(payload); return { code: 0, data: {} }; };
+        f.client.im.v1.chatMembers = { create: native, delete: native, get: native };
+        f.client.im.v1.chatManagers = { addManagers: native, deleteManagers: native };
+        await f.adapter.start();
+        try {
+            for (const action of ["chatMembers.create", "chatMembers.delete"]) {
+                await assert.rejects(f.adapter.callApi("oc_chat", action, {
+                    path: { chat_id: "oc_chat" },
+                    params: { member_id_type: "app" },
+                    data: { id_list: [config.appId] },
+                }), /member_id_type/);
+                await assert.rejects(f.adapter.callApi("oc_chat", action, {
+                    path: { chat_id: "oc_chat" },
+                    params: { member_id_type: "app_id" },
+                    data: { id_list: [] },
+                }), /data\.id_list/);
+                await assert.rejects(f.adapter.callApi("oc_chat", action, {
+                    path: { chat_id: "oc_chat" },
+                    params: { member_id_type: "app_id" },
+                    data: {},
+                }), /data\.id_list/);
+            }
+            await assert.rejects(f.adapter.callApi("oc_chat", "chatMembers.get", {
+                path: { chat_id: "oc_chat" },
+                params: { member_id_type: "app_id" },
+            }), /member_id_type/);
+            for (const action of ["chatManagers.addManagers", "chatManagers.deleteManagers"]) {
+                await assert.rejects(f.adapter.callApi("oc_chat", action, {
+                    path: { chat_id: "oc_chat" },
+                    params: { member_id_type: "open_id" },
+                    data: { manager_ids: [] },
+                }), /data\.manager_ids/);
+                await assert.rejects(f.adapter.callApi("oc_chat", action, {
+                    path: { chat_id: "oc_chat" },
+                    params: { member_id_type: "app" },
+                    data: { manager_ids: ["ou_user"] },
+                }), /member_id_type/);
+            }
+            assert.equal(nativeCalls.length, 0);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("accepts documented native action shapes and normalizes member IDs", async () => {
+        const f = fixture();
+        const calls: Array<{ action: string; payload: any }> = [];
+        const native = (action: string) => async (payload: any) => {
+            calls.push({ action, payload });
+            return { code: 0, data: {} };
+        };
+        f.client.im.v1.messageReaction = {
+            create: native("reactionCreate"),
+            delete: native("reactionDelete"),
+            list: native("reactionList"),
+            batchQuery: native("reactionBatch"),
+        };
+        f.client.im.v1.chatManagers = { addManagers: native("addManagers"), deleteManagers: native("deleteManagers") };
+        f.client.im.v1.chatMenuTree = { create: native("menuCreate"), delete: native("menuDelete"), sort: native("menuSort") };
+        f.client.im.v1.chatMenuItem = { patch: native("menuPatch") };
+        f.client.im.v1.chatMembers = { delete: native("membersDelete") };
+        await f.adapter.start();
+        try {
+            await f.adapter.callApi("oc_chat", "messageReaction.create", {
+                path: { message_id: "om_parent" },
+                data: { reaction_type: { emoji_type: "SMILE" } },
+            });
+            await f.adapter.callApi("oc_chat", "messageReaction.delete", {
+                path: { message_id: "om_parent", reaction_id: "reaction_1" },
+            });
+            await f.adapter.callApi("oc_chat", "messageReaction.list", {
+                path: { message_id: "om_parent" },
+                params: { user_id_type: "open_id" },
+            });
+            await f.adapter.callApi("oc_chat", "messageReaction.batchQuery", {
+                data: { queries: [{ message_id: "om_parent" }], page_size_per_message: 20 },
+            });
+            await f.adapter.callApi("oc_chat", "chatManagers.addManagers", {
+                path: { chat_id: "oc_chat" },
+                params: { member_id_type: "open_id" },
+                data: { manager_ids: ["feishu:ou_user"] },
+            });
+            await f.adapter.callApi("oc_chat", "chatManagers.deleteManagers", {
+                path: { chat_id: "oc_chat" },
+                params: { member_id_type: "app_id" },
+                data: { manager_ids: [`feishu:${config.appId}`] },
+            });
+            await f.adapter.callApi("oc_chat", "chatMenuTree.create", {
+                path: { chat_id: "oc_chat" },
+                data: { menu_tree: { chat_menu_top_levels: [{ chat_menu_item: { action_type: "NONE", name: "Menu" } }] } },
+            });
+            await f.adapter.callApi("oc_chat", "chatMenuTree.delete", {
+                path: { chat_id: "oc_chat" },
+                data: { chat_menu_top_level_ids: ["menu_1"] },
+            });
+            await f.adapter.callApi("oc_chat", "chatMenuTree.sort", {
+                path: { chat_id: "oc_chat" },
+                data: { chat_menu_top_level_ids: ["menu_1"] },
+            });
+            await f.adapter.callApi("oc_chat", "chatMenuItem.patch", {
+                path: { chat_id: "oc_chat", menu_item_id: "menu_1" },
+                data: { update_fields: ["NAME"], chat_menu_item: { name: "Menu" } },
+            });
+            await f.adapter.callApi("oc_chat", "chatMembers.delete", {
+                path: { chat_id: "oc_chat" },
+                params: { member_id_type: "app_id" },
+                data: { id_list: [`feishu:${config.appId}`] },
+            });
+            assert.deepEqual(calls.map(call => call.action), [
+                "reactionCreate", "reactionDelete", "reactionList", "reactionBatch",
+                "addManagers", "deleteManagers", "menuCreate", "menuDelete", "menuSort", "menuPatch", "membersDelete",
+            ]);
+            assert.deepEqual(calls.find(call => call.action === "addManagers")!.payload.data.manager_ids, ["ou_user"]);
+            assert.deepEqual(calls.find(call => call.action === "deleteManagers")!.payload.data.manager_ids, [config.appId]);
+            assert.deepEqual(calls.find(call => call.action === "membersDelete")!.payload.data.id_list, [config.appId]);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("rejects missing documented fields for native actions", async () => {
+        const f = fixture();
+        await f.adapter.start();
+        try {
+            const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+                ["message.patch", { path: { message_id: "om_parent" }, data: {} }, /data\.content/],
+                ["message.update", { path: { message_id: "om_parent" }, data: { content: "{}" } }, /data\.msg_type/],
+                ["message.update", { path: { message_id: "om_parent" }, data: { msg_type: "text" } }, /data\.content/],
+                ["message.update", { path: { message_id: "om_parent" }, data: { msg_type: "image", content: "{}" } }, /data\.msg_type/],
+                ["message.forward", { params: { receive_id_type: "chat_id" }, data: { receive_id: "oc_chat" } }, /path\.message_id/],
+                ["message.mergeForward", { params: { receive_id_type: "chat_id" }, data: { receive_id: "oc_chat" } }, /data\.message_id_list/],
+                ["message.readUsers", { path: { message_id: "om_parent" } }, /params\.user_id_type/],
+                ["message.readUsers", { path: { message_id: "om_parent" }, params: { user_id_type: "app_id" } }, /user_id_type/],
+                ["messageReaction.create", { path: { message_id: "om_parent" }, data: {} }, /data\.reaction_type/],
+                ["messageReaction.create", { path: { message_id: "om_parent" }, data: { reaction_type: {} } }, /emoji_type/],
+                ["messageReaction.delete", { path: { message_id: "om_parent" } }, /path\.reaction_id/],
+                ["messageReaction.list", { path: { message_id: "om_parent" }, params: { user_id_type: "app_id" } }, /user_id_type/],
+                ["messageReaction.batchQuery", {}, /data\.queries/],
+                ["messageReaction.batchQuery", { data: { queries: [] } }, /data\.queries/],
+                ["messageReaction.batchQuery", { data: { queries: [{}] } }, /message_id/],
+                ["pin.create", { data: {} }, /data\.message_id/],
+                ["pin.delete", {}, /path\.message_id/],
+                ["pin.list", {}, /params\.chat_id/],
+                ["chatMembers.create", { path: { chat_id: "oc_chat" }, params: { member_id_type: "open_id", succeed_type: 3 }, data: { id_list: ["ou_user"] } }, /succeed_type/],
+                ["chatManagers.addManagers", { path: { chat_id: "oc_chat" }, data: {} }, /data\.manager_ids/],
+                ["chatMenuTree.create", { path: { chat_id: "oc_chat" }, data: {} }, /data\.menu_tree/],
+                ["chatMenuTree.create", { path: { chat_id: "oc_chat" }, data: { menu_tree: { chat_menu_top_levels: [] } } }, /chat_menu_top_levels/],
+                ["chatMenuTree.create", { path: { chat_id: "oc_chat" }, data: { menu_tree: { chat_menu_top_levels: [{ chat_menu_item: { name: "Menu" } }] } } }, /action_type/],
+                ["chatMenuTree.delete", { path: { chat_id: "oc_chat" }, data: {} }, /chat_menu_top_level_ids/],
+                ["chatMenuTree.sort", { path: { chat_id: "oc_chat" }, data: { chat_menu_top_level_ids: [] } }, /chat_menu_top_level_ids/],
+                ["chatMenuItem.patch", { path: { chat_id: "oc_chat" }, data: { update_fields: ["NAME"], chat_menu_item: { name: "Menu" } } }, /path\.menu_item_id/],
+                ["chatMenuItem.patch", { path: { chat_id: "oc_chat", menu_item_id: "menu_1" }, data: { chat_menu_item: { name: "Menu" } } }, /data\.update_fields/],
+                ["chatMenuItem.patch", { path: { chat_id: "oc_chat", menu_item_id: "menu_1" }, data: { update_fields: [], chat_menu_item: { name: "Menu" } } }, /data\.update_fields/],
+                ["chatMenuItem.patch", { path: { chat_id: "oc_chat", menu_item_id: "menu_1" }, data: { update_fields: ["UNKNOWN"], chat_menu_item: { name: "Menu" } } }, /data\.update_fields/],
+                ["chatMenuItem.patch", { path: { chat_id: "oc_chat", menu_item_id: "menu_1" }, data: { update_fields: ["NAME"] } }, /data\.chat_menu_item/],
+                ["chat.link", { path: { chat_id: "oc_chat" }, data: { validity_period: "month" } }, /validity_period/],
+                ["chat.update", { path: { chat_id: "oc_chat" }, params: { user_id_type: "app_id" } }, /user_id_type/],
+                ["chatMembers.get", { path: { chat_id: "oc_chat" }, params: { member_id_type: "app_id" } }, /member_id_type/],
+            ];
+            for (const [action, payload, expected] of cases) {
+                await assert.rejects(f.adapter.callApi("oc_chat", action, payload), expected);
+            }
+        } finally { await f.adapter.stop(); }
+    });
+
     it("uses chat_mode for chat metadata and cached history classification", async () => {
         const f = fixture();
         f.client.im.v1.chat.get = async () => ({ code: 0, data: { name: "Direct", chat_mode: "p2p", chat_type: "private" } });
@@ -535,6 +1002,33 @@ describe("Feishu adapter host boundary edges", () => {
             const item = (history.items as any[])[0];
             assert.equal(item.chatType, "private");
             assert.equal(item.isDirectMessage, true);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("requests full card content for message reads and history", async () => {
+        const f = fixture();
+        const fullCard = {
+            schema: "2.0",
+            header: { template: "green", title: { tag: "plain_text", content: "示例卡片标题" } },
+            body: { elements: [{ tag: "markdown", content: "这是一段示例卡片正文，用于验证卡片内容解析。" }] },
+        };
+        f.messages.set("om_card_full", {
+            message_id: "om_card_full", chat_id: "oc_chat", chat_type: "group", msg_type: "interactive",
+            body: { content: JSON.stringify(fullCard) }, sender: { id: "ou_user", id_type: "open_id" }, create_time: time,
+        });
+        await f.adapter.start();
+        try {
+            const message = await f.adapter.getMessage("oc_chat", "om_card_full");
+            const text = String(message.text);
+            assert.match(text, /示例卡片标题/);
+            assert.match(text, /这是一段示例卡片正文/);
+            assert.ok(f.calls.some(call => call.method === "get" && call.payload.params.card_msg_content_type === "user_card_content"));
+
+            const history = await f.adapter.getHistory("oc_chat");
+            assert.ok(f.calls.some(call => call.method === "list" && call.payload.params.card_msg_content_type === "user_card_content"));
+            const item = (history.items as any[]).find(entry => entry.messageId === "om_card_full");
+            assert.ok(item);
+            assert.match(String(item.text), /这是一段示例卡片正文/);
         } finally { await f.adapter.stop(); }
     });
 
@@ -634,6 +1128,38 @@ describe("Feishu adapter host boundary edges", () => {
                 assert.equal((error as Error).message, "Feishu API business failure (99991663)");
                 return true;
             });
+            f.client.im.v1.message.create = async () => ({ code: 99991663, msg: "permission denied" });
+            await assert.rejects(f.adapter.sendText("oc_chat", "hello"), error => {
+                assert.equal((error as Error).message, "Feishu API business failure (99991663): permission denied");
+                return true;
+            });
+            f.client.im.v1.message.create = async () => ({ code: 99991663, msg: "permission denied", log_id: "log_test" });
+            await assert.rejects(f.adapter.sendText("oc_chat", "hello"), error => {
+                assert.equal((error as Error).message, "Feishu API business failure (99991663, log_id log_test): permission denied");
+                return true;
+            });
+            f.client.im.v1.message.create = async () => ({ code: 99991663, msg: "permission denied", error: { log_id: "log_body" } });
+            await assert.rejects(f.adapter.sendText("oc_chat", "hello"), error => {
+                assert.equal((error as Error).message, "Feishu API business failure (99991663, log_id log_body): permission denied");
+                return true;
+            });
+            f.client.im.v1.message.create = async () => {
+                throw { response: { status: 400, headers: { "X-Tt-Logid": "log_test" }, data: { code: 232001, msg: "invalid parameter" } } };
+            };
+            await assert.rejects(f.adapter.sendText("oc_chat", "hello"), error => {
+                assert.equal((error as Error).message, "Feishu API request failed (HTTP 400, code 232001, log_id log_test): invalid parameter");
+                return true;
+            });
+            f.client.im.v1.message.create = async () => {
+                throw { response: { status: 400, headers: { "X-Tt-Logid": "log_secret" }, data: { code: 232001, msg: config.appSecret } } };
+            };
+            await assert.rejects(f.adapter.sendText("oc_chat", "hello"), error => {
+                assert.ok(String(error).includes("log_id log_secret"));
+                assert.ok(!String(error).includes(config.appSecret));
+                return true;
+            });
+            f.client.im.v1.message.create = () => new Promise(() => {});
+            await assert.rejects(f.adapter.sendText("oc_chat", "hello"), /Feishu API request timed out/);
             f.client.im.v1.message.create = async () => { throw new Error(config.appSecret); };
             await assert.rejects(f.adapter.sendText("oc_chat", "hello"), error => !String(error).includes(config.appSecret));
         } finally { await f.adapter.stop(); }
@@ -659,11 +1185,12 @@ describe("Feishu adapter host boundary edges", () => {
             await assert.rejects(f.adapter.sendText("discord:oc_chat", "hello"), /identifier/);
             await assert.rejects(f.adapter.sendText("oc_chat", "hello", { replyInThread: true }), /parent/);
             assert.equal(f.adapter.canHandle("feishu.callApi"), true);
-            assert.equal(f.adapter.canHandle("feishu.searchMessages"), false);
+            assert.equal(f.adapter.canHandle("feishu.searchMessages"), true);
             assert.equal(f.adapter.canHandle("feishu.addReaction"), false);
             assert.deepEqual(f.adapter.getWriteMethods(), [
                 "feishu.sendText", "feishu.sendMessage", "feishu.sendMedia", "feishu.sendSticker",
                 "feishu.sendTemplateCard", "feishu.sendCard", "feishu.updateTemplateCard", "feishu.updateCard", "feishu.patchCard", "feishu.streamCardText",
+                "feishu.leaveChat",
             ]);
             await assert.rejects(f.adapter.handleCall("feishu.callApi", ["oc_chat", "unknown", {}]), /Unsupported/);
             assert.equal(f.calls.length, 0);
@@ -804,7 +1331,7 @@ describe("Feishu adapter host boundary edges", () => {
             await assert.rejects(f.adapter.downloadMedia(media.fileId, "oc_other"), /ownership/);
             await assert.rejects(f.adapter.downloadMedia(media.fileId, "oc_chat", "om_wrong"), /ownership/);
             await assert.rejects(f.adapter.downloadMedia(media.fileId, "oc_chat", "om_one", "wrong"), /ownership/);
-            assert.equal(f.calls.length, 0);
+            assert.equal(f.calls.filter(call => call.method === "resource").length, 0);
             assert.equal((await f.adapter.downloadMedia(null, media.fileId)).toString(), "media");
             const envelope = await f.adapter.handleCall("feishu.downloadMedia", [media.fileId, "oc_chat", "om_one", media.uniqueFileId]) as Record<string, unknown>;
             assert.deepEqual(envelope, { buffer: Buffer.from("media").toString("base64"), size: 5, fileName: "report.pdf" });
@@ -888,6 +1415,466 @@ describe("Feishu adapter host boundary edges", () => {
             const fetched = await f.adapter.getMessage("feishu:oc_a_b", "om_under");
             assert.equal(fetched.chatId, "feishu:oc_a_b");
             assert.equal(f.adapter.formatMention("feishu:ou_x_y", "X"), '<at user_id="ou_x_y">X</at>');
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("leaves a chat as the bot itself and clears cached chat metadata", async () => {
+        const f = fixture();
+        const removals: any[] = [];
+        f.client.im.v1.chatMembers = {
+            delete: async (payload: any) => {
+                removals.push(payload);
+                return { code: 0, data: {} };
+            },
+        };
+        await f.adapter.start();
+        try {
+            await f.adapter.getChat("oc_chat");
+            const result = await f.adapter.leaveChat("feishu:oc_chat");
+            assert.deepEqual(result, { chatId: "feishu:oc_chat", left: true, alreadyOut: false });
+            assert.equal(removals.length, 1);
+            assert.equal(removals[0].path.chat_id, "oc_chat");
+            assert.deepEqual(removals[0].data.id_list, [config.appId]);
+            assert.equal(removals[0].params.member_id_type, "app_id");
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("leaves a chat even when the chat is muted", async () => {
+        const f = fixture();
+        f.client.im.v1.chatMembers = { delete: async () => ({ code: 0, data: {} }) };
+        await f.adapter.start();
+        try {
+            f.adapter.muteChat("feishu:oc_chat", 60_000);
+            assert.equal(f.adapter.isChatMuted("feishu:oc_chat"), true);
+            const result = await f.adapter.leaveChat("oc_chat");
+            assert.equal(result.left, true);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("falls back to the bot open_id when app_id removal is rejected", async () => {
+        const f = fixture();
+        const attempts: Array<{ member_id_type: string; id_list: string[] }> = [];
+        f.client.im.v1.chatMembers = {
+            delete: async (payload: any) => {
+                attempts.push({ member_id_type: payload.params.member_id_type, id_list: payload.data.id_list });
+                if (payload.params.member_id_type === "app_id") throw new Error("app_id not accepted");
+                return { code: 0, data: {} };
+            },
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.leaveChat("oc_chat");
+            assert.equal(result.left, true);
+            assert.deepEqual(attempts.map(a => a.member_id_type), ["app_id", "open_id"]);
+            assert.deepEqual(attempts[1].id_list, ["ou_bot"]);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("treats 232011 as an idempotent leave for chats the bot already left", async () => {
+        const f = fixture();
+        f.client.im.v1.chatMembers = {
+            delete: async () => {
+                throw feishuError(232011, "Operator can NOT be out of the chat.");
+            },
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.leaveChat("oc_chat");
+            assert.equal(result.left, true);
+            assert.equal(result.alreadyOut, true);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("searches messages with the native search API and surfaces missing scope errors", async () => {
+        const f = fixture();
+        const searches: any[] = [];
+        (f.client.im.v1.message as any).search = async (payload: any) => {
+            searches.push(payload);
+            return {
+                code: 0,
+                data: {
+                    items: [{
+                        id: "1",
+                        display_info: "hello world",
+                        meta_data: {
+                            message_id: "om_hit",
+                            chat_id: "oc_chat",
+                            from_id: "ou_user",
+                            type: "text",
+                            create_time: time,
+                        },
+                    }],
+                    has_more: false,
+                    total: 1,
+                },
+            };
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.searchMessages("hello", { filter: { chat_ids: ["feishu:oc_chat"], from_ids: ["feishu:ou_user"] } });
+            assert.equal(searches[0].data.query, "hello");
+            assert.deepEqual(searches[0].data.filter.chat_ids, ["oc_chat"]);
+            assert.deepEqual(searches[0].data.filter.from_ids, ["ou_user"]);
+            // 官方文档：page_size 默认 15、最大 30。
+            assert.equal(searches[0].params.page_size, 15);
+            assert.equal(result.total, 1);
+            const hit = (result.items as any[])[0];
+            assert.equal(hit.messageId, "om_hit");
+            assert.equal(hit.chatId, "feishu:oc_chat");
+            assert.equal(hit.userId, "feishu:ou_user");
+            await assert.rejects(f.adapter.searchMessages("", {}), /requires query/);
+            (f.client.im.v1.message as any).search = async () => {
+                throw feishuError(99991672, "Access denied. [search:message]");
+            };
+            await assert.rejects(f.adapter.searchMessages("hello"), /99991672/);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("parses ISO8601 search timestamps and forwards exclude_from_types", async () => {
+        const f = fixture();
+        const searches: any[] = [];
+        (f.client.im.v1.message as any).search = async (payload: any) => {
+            searches.push(payload);
+            return {
+                code: 0,
+                data: {
+                    items: [{
+                        id: "1",
+                        display_info: "命中片段",
+                        meta_data: {
+                            message_id: "om_hit",
+                            chat_id: "oc_chat",
+                            type: "text",
+                            // 官方文档示例：create_time 是 ISO8601，不是毫秒时间戳。
+                            create_time: "2026-03-21T16:15:30+08:00",
+                        },
+                    }],
+                    has_more: false,
+                },
+            };
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.searchMessages("", {
+                filter: { exclude_from_types: ["bot"], is_at_me: true },
+            });
+            assert.deepEqual(searches[0].data.filter.exclude_from_types, ["bot"]);
+            assert.equal(searches[0].data.filter.is_at_me, true);
+            const hit = (result.items as any[])[0];
+            assert.equal(hit.timestamp, new Date("2026-03-21T16:15:30+08:00").toISOString());
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("lists chat members across pages and reports totals", async () => {
+        const f = fixture();
+        let page = 0;
+        f.client.im.v1.chatMembers = {
+            get: async () => {
+                page++;
+                return {
+                    code: 0,
+                    data: {
+                        items: [{ member_id: `ou_member_${page}`, member_id_type: "open_id", name: `Member ${page}` }],
+                        has_more: page < 2,
+                        page_token: page < 2 ? `page_${page + 1}` : undefined,
+                        member_total: 2,
+                    },
+                };
+            },
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.getChatMembers("feishu:oc_chat", { pageSize: 1 });
+            assert.equal(page, 2);
+            assert.equal(result.memberTotal, 2);
+            assert.equal(result.hasMore, false);
+            const items = result.items as any[];
+            assert.deepEqual(items.map(item => item.userId), ["feishu:ou_member_1", "feishu:ou_member_2"]);
+            assert.deepEqual(items.map(item => item.displayName), ["Member 1", "Member 2"]);
+            await assert.rejects(f.adapter.getChatMembers("oc_chat", { memberIdType: "app_id" as any }), /memberIdType/);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("exposes bot identity from the bot info endpoint", async () => {
+        const f = fixture();
+        f.client.request = (async () => ({ code: 0, bot: { open_id: "ou_bot", app_name: "CyberGroupmate", avatar_url: "https://example/avatar.png", activate_status: 2 } })) as any;
+        await f.adapter.start();
+        try {
+            const info = await f.adapter.getBotInfo();
+            assert.equal(info.userId, "feishu:ou_bot");
+            assert.equal(info.openId, "ou_bot");
+            assert.equal(info.appId, config.appId);
+            assert.equal(info.name, "CyberGroupmate");
+            assert.equal(info.activateStatus, 2);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("exposes chat moderation, announcement and top notice native actions", async () => {
+        const f = fixture();
+        const calls: Array<{ action: string; payload: any }> = [];
+        const native = (action: string) => async (payload: any) => {
+            calls.push({ action, payload });
+            return { code: 0, data: {} };
+        };
+        f.client.im.v1.chatModeration = { get: native("moderationGet"), update: native("moderationUpdate") };
+        f.client.im.v1.chatAnnouncement = { get: native("announcementGet"), patch: native("announcementPatch") };
+        f.client.im.v1.chatTopNotice = { putTopNotice: native("topNoticePut"), deleteTopNotice: native("topNoticeDelete") };
+        f.client.im.v1.chatMenuTree = { get: native("menuGet") };
+        await f.adapter.start();
+        try {
+            await f.adapter.callApi("oc_chat", "chatModeration.get", { path: { chat_id: "oc_chat" }, params: { user_id_type: "open_id" } });
+            await f.adapter.callApi("oc_chat", "chatModeration.update", {
+                path: { chat_id: "oc_chat" },
+                data: { moderation_setting: "only_owner", moderator_added_list: ["feishu:ou_user"] },
+            });
+            await f.adapter.callApi("oc_chat", "chatAnnouncement.get", { path: { chat_id: "oc_chat" } });
+            await f.adapter.callApi("oc_chat", "chatAnnouncement.patch", {
+                path: { chat_id: "oc_chat" },
+                data: { revision: "1", requests: ["{}"] },
+            });
+            await f.adapter.callApi("oc_chat", "chatTopNotice.putTopNotice", {
+                path: { chat_id: "oc_chat" },
+                data: { chat_top_notice: [{ action_type: "1", message_id: "feishu:om_parent" }] },
+            });
+            await f.adapter.callApi("oc_chat", "chatTopNotice.deleteTopNotice", { path: { chat_id: "oc_chat" } });
+            await f.adapter.callApi("oc_chat", "chatMenuTree.get", { path: { chat_id: "oc_chat" } });
+            assert.deepEqual(calls.map(call => call.action), [
+                "moderationGet", "moderationUpdate", "announcementGet", "announcementPatch",
+                "topNoticePut", "topNoticeDelete", "menuGet",
+            ]);
+            assert.deepEqual(calls[1].payload.data.moderator_added_list, ["ou_user"]);
+            assert.deepEqual(calls[4].payload.data.chat_top_notice[0].message_id, "om_parent");
+
+            await assert.rejects(f.adapter.callApi("oc_chat", "chatModeration.update", { path: { chat_id: "oc_chat" }, data: {} }), /moderation_setting/);
+            await assert.rejects(f.adapter.callApi("oc_chat", "chatAnnouncement.patch", { path: { chat_id: "oc_chat" }, data: {} }), /data\.revision/);
+            await assert.rejects(f.adapter.callApi("oc_chat", "chatTopNotice.putTopNotice", {
+                path: { chat_id: "oc_chat" },
+                data: { chat_top_notice: [{ action_type: "1", message_id: "om_a" }, { action_type: "1", message_id: "om_b" }] },
+            }), /at most one top notice/);
+            // 文档：action_type=1（消息置顶）必须带 message_id。
+            await assert.rejects(f.adapter.callApi("oc_chat", "chatTopNotice.putTopNotice", {
+                path: { chat_id: "oc_chat" },
+                data: { chat_top_notice: [{ action_type: "1" }] },
+            }), /requires data\.chat_top_notice\[0\]\.message_id/);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("falls back to the docx announcement API when the chat uses docx announcements", async () => {
+        const f = fixture();
+        f.client.im.v1.chatAnnouncement = {
+            get: async () => {
+                throw feishuError(232097, "Unable to operate docx type chat announcement.");
+            },
+        };
+        f.client.docx = {
+            v1: {
+                chatAnnouncement: {
+                    get: async () => ({
+                        code: 0,
+                        data: { announcement_type: "docx", revision_id: 3, owner_id: "ou_user", create_time: 1790587144 },
+                    }),
+                },
+                chatAnnouncementBlock: {
+                    list: async () => ({
+                        code: 0,
+                        data: {
+                            items: [{ block_id: "b1", block_type: 2, text: { elements: [{ text_run: { content: "群公告正文" } }] } }],
+                            has_more: false,
+                        },
+                    }),
+                },
+            },
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.getChatAnnouncement("oc_chat");
+            assert.equal(result.announcementType, "docx");
+            assert.equal(result.revision, "3");
+            assert.equal(result.text, "群公告正文");
+            assert.equal((result.blocks as unknown[]).length, 1);
+            assert.equal(result.ownerId, "feishu:ou_user");
+            // 文档：create_time 是秒级时间戳。
+            assert.equal(result.createTime, new Date(1790587144 * 1000).toISOString());
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("reads legacy doc announcements without falling back", async () => {
+        const f = fixture();
+        f.client.im.v1.chatAnnouncement = {
+            get: async () => ({ code: 0, data: { content: "旧版公告", revision: "0", owner_id: "ou_user" } }),
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.getChatAnnouncement("oc_chat");
+            assert.equal(result.announcementType, "doc");
+            assert.equal(result.content, "旧版公告");
+            assert.equal(result.revision, "0");
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("follows docx announcement page tokens instead of refetching the first page", async () => {
+        const f = fixture();
+        const pages: Array<Record<string, unknown>> = [];
+        f.client.im.v1.chatAnnouncement = {
+            get: async () => {
+                throw feishuError(232097, "Unable to operate docx type chat announcement.");
+            },
+        };
+        f.client.docx = {
+            v1: {
+                chatAnnouncement: {
+                    get: async () => ({ code: 0, data: { announcement_type: "docx", revision_id: 3 } }),
+                },
+                chatAnnouncementBlock: {
+                    list: async (payload: any) => {
+                        pages.push(payload.params);
+                        const second = payload.params.page_token === "page_2";
+                        return {
+                            code: 0,
+                            data: {
+                                items: [{ block_id: second ? "b2" : "b1", block_type: 2, text: { elements: [{ text_run: { content: second ? "第二页" : "第一页" } }] } }],
+                                has_more: !second,
+                                ...(second ? {} : { page_token: "page_2" }),
+                            },
+                        };
+                    },
+                },
+            },
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.getChatAnnouncement("oc_chat");
+            assert.equal(pages.length, 2);
+            assert.equal(pages[0].page_token, undefined);
+            assert.equal(pages[1].page_token, "page_2");
+            assert.equal(result.text, "第一页\n第二页");
+            assert.equal((result.blocks as unknown[]).length, 2);
+            assert.equal(result.hasMore, false);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("keeps app_id announcement owners unprefixed", async () => {
+        const f = fixture();
+        f.client.im.v1.chatAnnouncement = {
+            get: async () => ({
+                code: 0,
+                data: {
+                    content: "机器人创建的公告",
+                    revision: "1",
+                    owner_id: "cli_a2beeb8d2b79900b",
+                    owner_id_type: "app_id",
+                    modifier_id: "cli_a2beeb8d2b79900b",
+                    modifier_id_type: "app_id",
+                },
+            }),
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.getChatAnnouncement("oc_chat");
+            assert.equal(result.ownerId, "cli_a2beeb8d2b79900b");
+            assert.equal(result.ownerIdType, "app_id");
+            assert.equal(result.modifierId, "cli_a2beeb8d2b79900b");
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("requires at least one request when patching an announcement", async () => {
+        const f = fixture();
+        f.client.im.v1.chatAnnouncement = { patch: async () => ({ code: 0, data: {} }) };
+        await f.adapter.start();
+        try {
+            await assert.rejects(f.adapter.callApi("oc_chat", "chatAnnouncement.patch", {
+                path: { chat_id: "oc_chat" },
+                data: { revision: "0", requests: [] },
+            }), /data\.requests/);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("routes docx announcement block writes to the docx API", async () => {
+        const f = fixture();
+        const calls: Array<{ action: string; payload: any }> = [];
+        const native = (action: string) => async (payload: any) => {
+            calls.push({ action, payload });
+            return { code: 0, data: {} };
+        };
+        f.client.docx = {
+            v1: {
+                chatAnnouncementBlock: { list: native("blockList"), batchUpdate: native("blockBatchUpdate") },
+                chatAnnouncementBlockChildren: { create: native("childCreate"), batchDelete: native("childBatchDelete") },
+            },
+        };
+        await f.adapter.start();
+        try {
+            await f.adapter.callApi("oc_chat", "chatAnnouncementBlock.list", {
+                path: { chat_id: "oc_chat" },
+                params: { revision_id: -1 },
+            });
+            await f.adapter.callApi("oc_chat", "chatAnnouncementBlock.batchUpdate", {
+                path: { chat_id: "oc_chat" },
+                data: { requests: [{ block_id: "doxcnA", update_text_elements: { elements: [{ text_run: { content: "x" } }] } }] },
+            });
+            await f.adapter.callApi("oc_chat", "chatAnnouncementBlockChildren.create", {
+                path: { chat_id: "oc_chat", block_id: "doxcnRoot" },
+                data: { children: [{ block_type: 2, text: { elements: [{ text_run: { content: "新块" } }] } }] },
+            });
+            await f.adapter.callApi("oc_chat", "chatAnnouncementBlockChildren.batchDelete", {
+                path: { chat_id: "oc_chat", block_id: "doxcnRoot" },
+                data: { start_index: 0, end_index: 1 },
+            });
+            assert.deepEqual(calls.map(call => call.action), ["blockList", "blockBatchUpdate", "childCreate", "childBatchDelete"]);
+            // docx 块 ID 不是 oc_/om_/ou_ 体系，不应被 ID 校验拦下。
+            assert.equal(calls[2].payload.path.block_id, "doxcnRoot");
+            await assert.rejects(f.adapter.callApi("oc_chat", "chatAnnouncementBlockChildren.batchDelete", {
+                path: { chat_id: "oc_chat", block_id: "doxcnRoot" },
+                data: { start_index: 2, end_index: 2 },
+            }), /end_index/);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("reports unknown member totals honestly instead of pretending -1 is exact", async () => {
+        const f = fixture();
+        f.client.im.v1.chatMembers = {
+            get: async () => ({
+                code: 0,
+                data: { items: [{ member_id: "ou_a", member_id_type: "open_id", name: "A" }], has_more: false, member_total: -1 },
+            }),
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.getChatMembers("oc_chat");
+            assert.equal(result.memberTotalIsExact, false);
+            assert.equal(result.memberTotal, 1);
+        } finally { await f.adapter.stop(); }
+    });
+
+    it("returns a normalized chat menu", async () => {
+        const f = fixture();
+        f.client.im.v1.chatMenuTree = {
+            get: async () => ({
+                code: 0,
+                data: {
+                    menu_tree: {
+                        chat_menu_top_levels: [{
+                            chat_menu_top_level_id: "m1",
+                            chat_menu_item: { name: "帮助", action_type: "REDIRECT_LINK", redirect_link: { common_url: "https://example" } },
+                            children: [{
+                                chat_menu_second_level_id: "m1-1",
+                                chat_menu_item: { name: "报名", action_type: "REDIRECT_LINK" },
+                            }],
+                        }],
+                    },
+                },
+            }),
+        };
+        await f.adapter.start();
+        try {
+            const result = await f.adapter.getChatMenu("oc_chat");
+            assert.equal(result.chatId, "feishu:oc_chat");
+            const items = result.items as any[];
+            assert.equal(items[0].name, "帮助");
+            assert.equal(items[0].actionType, "REDIRECT_LINK");
+            // 二级菜单 ID 的官方字段名是 chat_menu_second_level_id，不能读成 chat_menu_item_id。
+            assert.equal(items[0].children[0].menuItemId, "m1-1");
+            assert.equal(items[0].children[0].name, "报名");
         } finally { await f.adapter.stop(); }
     });
 });

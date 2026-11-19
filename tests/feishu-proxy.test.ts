@@ -393,7 +393,7 @@ describe("Feishu sandbox API boundary", () => {
     it("provides Feishu-only execution guidance without relying on generated docs", async () => {
         const { getPlatformExecutionGuidance } = await import("../src/subagent/code-act-executor.js");
         const guidance = getPlatformExecutionGuidance("feishu");
-        for (const term of ["feishu:oc_x", "om_x", "replyToMessageId", "replyInThread", "mentions", "sendMedia", "photo", "document", "audio", "video", "10 MiB", "30 MiB", "callApi", "getHistory", "sendSticker", "sendTemplateCard", "streamCardText", "forwardedMessages", "card.action.trigger", "additionalMessages", "captionError", "readUsers"]) {
+        for (const term of ["feishu:oc_x", "om_x", "replyToMessageId", "replyInThread", "mentions", "sendMedia", "photo", "document", "audio", "video", "10 MiB", "30 MiB", "markdown", "callApi", "getHistory", "sendSticker", "sendTemplateCard", "streamCardText", "forwardedMessages", "card.action.trigger", "additionalMessages", "captionError", "readUsers"]) {
             assert.ok(guidance.includes(term), term);
         }
         for (const platform of ["telegram", "discord", "onebot"]) {
@@ -407,8 +407,10 @@ describe("Feishu sandbox API boundary", () => {
         const module = registry.find(entry => entry.name === "feishu");
         assert.ok(module);
         assert.deepEqual(module.methods.map(method => method.name).sort(), [
-            "callApi", "downloadMedia", "getChat", "getHistory", "getMessage", "patchCard", "sendCard",
-            "sendMedia", "sendMessage", "sendSticker", "sendTemplateCard", "sendText", "streamCardText", "updateCard", "updateTemplateCard",
+            "callApi", "downloadMedia", "getBotInfo", "getChat", "getChatAnnouncement", "getChatMembers",
+            "getChatMenu", "getHistory", "getMessage", "leaveChat", "patchCard", "searchMessages", "sendCard",
+            "sendMedia", "sendMessage", "sendSticker", "sendTemplateCard", "sendText", "streamCardText",
+            "updateCard", "updateTemplateCard",
         ]);
         assert.match(generateBriefOverview(registry), /sendText\(chatId, text, options\?\)/);
         assert.match(lookupFullDocs(registry, ["feishu.sendMedia"]), /FeishuMedia/);
